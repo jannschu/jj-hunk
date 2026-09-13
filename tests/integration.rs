@@ -578,3 +578,120 @@ fn list_rev_with_spec_filters_output() {
         out
     );
 }
+
+#[test]
+fn list_query_selects_whole_blocks_in_the_requested_revision() {
+    let repo = TestRepo::new("list-query");
+    repo.write_file(
+        "src/server.rs",
+        "header\ntimeout = 10\nmiddle\nretry = false\nfooter\n",
+    );
+    repo.write_file("other.rs", "timeout = 10\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file(
+        "src/server.rs",
+        "header\ntimeout = 20\nmiddle\nretry = true\nfooter\n",
+    );
+    repo.write_file("other.rs", "timeout = 20\n");
+    repo.jj_ok(&["commit", "-m", "changes"]);
+
+    let diff_before = repo.jj_ok(&["diff", "--git", "-r", "@-"]);
+    let output = repo.hunk_ok(&[
+        "list",
+        "-r",
+        "@-",
+        "--query",
+        "files(\"src/**\") & content(\"timeout\")",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["path"], "src/server.rs");
+    let hunks = value["files"][0]["hunks"].as_array().unwrap();
+    assert_eq!(hunks.len(), 1, "unexpected query output: {output}");
+    assert_eq!(hunks[0]["added"], "timeout = 20\n");
+    assert_eq!(repo.jj_ok(&["diff", "--git", "-r", "@-"]), diff_before);
+}
+
+#[test]
+fn list_query_evaluates_complete_content_before_display_limits() {
+    let repo = TestRepo::new("list-query-complete");
+    repo.write_file("src/server.rs", "one\ntwo\nthree\ntimeout = 10\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src/server.rs", "one\ntwo\nthree\ntimeout = 20\n");
+    repo.jj_ok(&["commit", "-m", "changes"]);
+
+    let output = repo.hunk_ok(&[
+        "list",
+        "-r",
+        "@-",
+        "--query",
+        "content(\"timeout\")",
+        "--max-lines",
+        "1",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    assert_eq!(value["files"][0]["hunks"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+fn list_query_rejects_unsupported_file_units_and_conflicting_filters() {
+    let repo = TestRepo::new("list-query-errors");
+    repo.write_file("created.rs", "timeout\n");
+
+    let unsupported = repo.hunk_fail(&["list", "--query", "content(\"timeout\")"]);
+    assert!(unsupported.contains("does not yet support file-level `added` changes"));
+
+    let binary_repo = TestRepo::new("list-query-binary");
+    binary_repo.jj_ok(&["commit", "-m", "base"]);
+    binary_repo.write_file("binary.dat", "value\0binary");
+    let binary = binary_repo.hunk_fail(&["list", "--query", "all()", "--binary", "skip"]);
+    assert!(binary.contains("file-level `binary` changes"), "{binary}");
+
+    let include = repo.hunk_fail(&["list", "--query", "all()", "--include", "src/**"]);
+    assert!(include.contains("cannot be used with"));
+
+    let spec = repo.hunk_fail(&["list", "--query", "all()", "--spec", "{}"]);
+    assert!(spec.contains("cannot be used with"));
+
+    let invalid = repo.hunk_fail(&["list", "--query", "unknown()"]);
+    assert!(invalid.contains("Invalid hunkset query"));
+    assert!(invalid.contains("unknown function `unknown`"));
+}
+
+#[cfg(unix)]
+#[test]
+fn list_query_rejects_mode_units_even_when_text_also_changed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("list-query-mode");
+    repo.write_file("script.sh", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("script.sh", "new\n");
+    let path = repo.path().join("script.sh");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+
+    let error = repo.hunk_fail(&["list", "--query", "content(\"new\")"]);
+    assert!(error.contains("file-level `mode` changes"), "{error}");
+}
+
+#[cfg(unix)]
+#[test]
+fn list_query_rejects_symlinks_without_regressing_ordinary_list() {
+    use std::os::unix::fs::symlink;
+
+    let repo = TestRepo::new("list-query-symlink");
+    symlink("missing-old", repo.path().join("link")).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("link")).unwrap();
+    symlink("missing-new", repo.path().join("link")).unwrap();
+
+    repo.hunk_ok(&["list"]);
+    let error = repo.hunk_fail(&["list", "--query", "all()"]);
+    assert!(
+        error.contains("file-level `special-file` changes"),
+        "{error}"
+    );
+}

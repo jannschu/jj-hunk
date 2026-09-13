@@ -1,9 +1,9 @@
 use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 
+mod commands;
 mod diff;
 mod spec;
-mod commands;
 
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions};
 
@@ -96,11 +96,17 @@ struct ListArgs {
     #[arg(long)]
     max_lines: Option<usize>,
     /// Optional JSON/YAML spec to preview (inline or '-')
-    #[arg(long)]
+    #[arg(long, conflicts_with = "query")]
     spec: Option<String>,
     /// Read spec from a file (JSON or YAML)
-    #[arg(long = "spec-file", short = 'f')]
+    #[arg(long = "spec-file", short = 'f', conflicts_with = "query")]
     spec_file: Option<String>,
+    /// Select text blocks with a hunkset query
+    #[arg(
+        long,
+        conflicts_with_all = ["include", "exclude", "files", "spec_template"]
+    )]
+    query: Option<String>,
     /// Only list files with hunk counts
     #[arg(long, conflicts_with = "spec_template")]
     files: bool,
@@ -131,6 +137,7 @@ fn main() -> Result<()> {
                 mode,
                 spec: args.spec,
                 spec_file: args.spec_file,
+                query: args.query,
                 binary: args.binary,
                 max_bytes: args.max_bytes,
                 max_lines: args.max_lines,
@@ -147,7 +154,12 @@ fn main() -> Result<()> {
             rev,
         } => {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "split")?;
-            commands::split(spec.as_deref(), spec_file.as_deref(), &message, rev.as_deref())
+            commands::split(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                &message,
+                rev.as_deref(),
+            )
         }
         Commands::Commit {
             spec,
@@ -157,7 +169,11 @@ fn main() -> Result<()> {
             let (spec, message) = normalize_spec_message(spec, message, &spec_file, "commit")?;
             commands::commit(spec.as_deref(), spec_file.as_deref(), &message)
         }
-        Commands::Squash { spec, spec_file, rev } => {
+        Commands::Squash {
+            spec,
+            spec_file,
+            rev,
+        } => {
             let spec = normalize_spec_only(spec, &spec_file, "squash")?;
             commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref())
         }
@@ -174,8 +190,7 @@ fn normalize_spec_message(
         message = spec.take();
     }
 
-    let message = message
-        .ok_or_else(|| anyhow::anyhow!("{command} requires a commit message"))?;
+    let message = message.ok_or_else(|| anyhow::anyhow!("{command} requires a commit message"))?;
 
     if spec_file.is_some() {
         if spec.is_some() {
@@ -184,8 +199,8 @@ fn normalize_spec_message(
         return Ok((None, message));
     }
 
-    let spec = spec
-        .ok_or_else(|| anyhow::anyhow!("{command} requires a spec (or use --spec-file)"))?;
+    let spec =
+        spec.ok_or_else(|| anyhow::anyhow!("{command} requires a spec (or use --spec-file)"))?;
     Ok((Some(spec), message))
 }
 
@@ -201,7 +216,7 @@ fn normalize_spec_only(
         return Ok(None);
     }
 
-    let spec = spec
-        .ok_or_else(|| anyhow::anyhow!("{command} requires a spec (or use --spec-file)"))?;
+    let spec =
+        spec.ok_or_else(|| anyhow::anyhow!("{command} requires a spec (or use --spec-file)"))?;
     Ok(Some(spec))
 }

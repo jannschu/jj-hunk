@@ -2,6 +2,7 @@ use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
+use hunkset::{evaluate, OccurrenceKey, SelectableUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -80,6 +81,7 @@ pub struct ListOptions {
     pub mode: ListMode,
     pub spec: Option<String>,
     pub spec_file: Option<String>,
+    pub query: Option<String>,
     pub binary: BinaryMode,
     pub max_bytes: Option<usize>,
     pub max_lines: Option<usize>,
@@ -96,6 +98,7 @@ impl Default for ListOptions {
             mode: ListMode::default(),
             spec: None,
             spec_file: None,
+            query: None,
             binary: BinaryMode::default(),
             max_bytes: None,
             max_lines: None,
@@ -193,6 +196,18 @@ struct DiffSummaryEntry {
     source: String,
     #[serde(default)]
     target: String,
+    #[serde(default)]
+    source_type: String,
+    #[serde(default)]
+    target_type: String,
+    #[serde(default)]
+    source_executable: bool,
+    #[serde(default)]
+    target_executable: bool,
+    #[serde(default)]
+    source_conflict: bool,
+    #[serde(default)]
+    target_conflict: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -207,6 +222,7 @@ where
     T: Into<ListOptions>,
 {
     let mut options = options.into();
+    validate_query_options(&options)?;
     options.spec = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
     options.spec_file = None;
 
@@ -250,6 +266,7 @@ fn render_materialized_list(
     let exclude = normalize_patterns(&options.exclude);
 
     let mut files = Vec::new();
+    let query = options.query.as_deref();
 
     for entry in request.summary_entries {
         let path = primary_path(&entry);
@@ -271,26 +288,57 @@ fn render_materialized_list(
         let after_bytes = read_materialized_file(after_root, file_paths.after.as_deref())?;
 
         let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
+        let mode_changed = entry.source_executable != entry.target_executable;
+        let special_type = entry.source_type != "file" || entry.target_type != "file";
+        if query.is_some()
+            && (entry.status != "modified"
+                || is_binary
+                || mode_changed
+                || special_type
+                || entry.source_conflict
+                || entry.target_conflict)
+        {
+            let unsupported_kind = if is_binary {
+                "binary"
+            } else if entry.source_conflict || entry.target_conflict {
+                "conflict"
+            } else if mode_changed {
+                "mode"
+            } else if special_type && entry.status == "modified" {
+                "special-file"
+            } else {
+                entry.status.as_str()
+            };
+            anyhow::bail!(
+                "query preview does not yet support file-level `{}` changes: {}",
+                unsupported_kind,
+                path
+            );
+        }
         if is_binary && options.binary == BinaryMode::Skip {
             continue;
         }
 
         let should_diff = !(is_binary && options.binary == BinaryMode::Mark);
-        let (before_text, before_truncated) = if should_diff {
+        let (before_text, before_truncated) = if should_diff && query.is_none() {
             truncate_text(
                 &String::from_utf8_lossy(&before_bytes),
                 options.max_bytes,
                 options.max_lines,
             )
+        } else if should_diff {
+            (String::from_utf8_lossy(&before_bytes).into_owned(), false)
         } else {
             (String::new(), false)
         };
-        let (after_text, after_truncated) = if should_diff {
+        let (after_text, after_truncated) = if should_diff && query.is_none() {
             truncate_text(
                 &String::from_utf8_lossy(&after_bytes),
                 options.max_bytes,
                 options.max_lines,
             )
+        } else if should_diff {
+            (String::from_utf8_lossy(&after_bytes).into_owned(), false)
         } else {
             (String::new(), false)
         };
@@ -303,6 +351,13 @@ fn render_materialized_list(
 
         if let SpecDecision::KeepSelection(selection) = &decision {
             hunks = filter_hunks(hunks, selection);
+        }
+
+        if query.is_some() && hunks.is_empty() {
+            anyhow::bail!(
+                "query preview does not yet support file-level changes without text blocks: {}",
+                path
+            );
         }
 
         if hunks.is_empty() && !is_binary {
@@ -320,6 +375,10 @@ fn render_materialized_list(
             binary: if is_binary { Some(true) } else { None },
             truncated: if truncated { Some(true) } else { None },
         });
+    }
+
+    if let Some(query) = query {
+        filter_files_by_query(&mut files, query, options.max_bytes, options.max_lines)?;
     }
 
     match options.mode {
@@ -365,7 +424,69 @@ fn render_materialized_list(
     }
 }
 
-const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ "}\n""#;
+fn validate_query_options(options: &ListOptions) -> Result<()> {
+    let Some(query) = options.query.as_deref() else {
+        return Ok(());
+    };
+    if options.spec.is_some() || options.spec_file.is_some() {
+        anyhow::bail!("--query cannot be combined with --spec or --spec-file");
+    }
+    if !options.include.is_empty() || !options.exclude.is_empty() {
+        anyhow::bail!("--query cannot be combined with --include or --exclude");
+    }
+    if options.mode != ListMode::Full {
+        anyhow::bail!("--query supports full list output only");
+    }
+    evaluate(query, &[]).context("Invalid hunkset query")?;
+    Ok(())
+}
+
+fn filter_files_by_query(
+    files: &mut Vec<FileEntry>,
+    query: &str,
+    max_bytes: Option<usize>,
+    max_lines: Option<usize>,
+) -> Result<()> {
+    let units = files
+        .iter()
+        .flat_map(|file| {
+            file.hunks.iter().map(|hunk| {
+                SelectableUnit::text(&file.path, &file.path, &hunk.removed, &hunk.added)
+                    .expect("materialized diff paths are nonempty")
+            })
+        })
+        .collect::<Vec<_>>();
+    let selected_indices = evaluate(query, &units)
+        .context("Invalid hunkset query")?
+        .into_iter()
+        .map(OccurrenceKey::index)
+        .collect::<HashSet<_>>();
+
+    let mut occurrence_index = 0usize;
+    for file in files.iter_mut() {
+        let mut display_truncated = false;
+        file.hunks.retain_mut(|hunk| {
+            let keep = selected_indices.contains(&occurrence_index);
+            occurrence_index += 1;
+            if keep {
+                let (removed, removed_truncated) =
+                    truncate_text(&hunk.removed, max_bytes, max_lines);
+                let (added, added_truncated) = truncate_text(&hunk.added, max_bytes, max_lines);
+                hunk.removed = removed;
+                hunk.added = added;
+                display_truncated |= removed_truncated || added_truncated;
+            }
+            keep
+        });
+        if display_truncated {
+            file.truncated = Some(true);
+        }
+    }
+    files.retain(|file| !file.hunks.is_empty());
+    Ok(())
+}
+
+const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_type\":" ++ self.source().file_type().escape_json() ++ ",\"target_type\":" ++ self.target().file_type().escape_json() ++ ",\"source_executable\":" ++ self.source().executable() ++ ",\"target_executable\":" ++ self.target().executable() ++ ",\"source_conflict\":" ++ self.source().conflict() ++ ",\"target_conflict\":" ++ self.target().conflict() ++ "}\n""#;
 
 struct FilePaths {
     before: Option<String>,

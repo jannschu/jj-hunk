@@ -18,3 +18,4 @@ anyhow = "1"
 walkdir = "2"
 serde_yaml = "0.9"
 sha2 = "0.10"
+hunkset = { path = "crates/hunkset" }

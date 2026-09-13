@@ -208,6 +208,7 @@ version = "0.4.1"
 dependencies = [
  "anyhow",
  "clap",
+ "hunkset",
  "serde",
  "serde_json",
  "serde_yaml",
