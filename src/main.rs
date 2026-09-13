@@ -40,6 +40,9 @@ enum Commands {
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
         spec_file: Option<String>,
+        /// Select occurrences with a hunkset query instead of a spec
+        #[arg(long, conflicts_with = "spec_file")]
+        query: Option<String>,
         /// Revision to split (default: @)
         #[arg(short, long)]
         rev: Option<String>,
@@ -54,6 +57,9 @@ enum Commands {
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
         spec_file: Option<String>,
+        /// Select occurrences with a hunkset query instead of a spec
+        #[arg(long, conflicts_with = "spec_file")]
+        query: Option<String>,
     },
 
     /// Squash selected hunks into parent
@@ -63,6 +69,9 @@ enum Commands {
         /// Read spec from a file (JSON or YAML)
         #[arg(long = "spec-file", short = 'f')]
         spec_file: Option<String>,
+        /// Select occurrences with a hunkset query instead of a spec
+        #[arg(long, conflicts_with = "spec_file")]
+        query: Option<String>,
         /// Revision to squash (default: @)
         #[arg(short, long)]
         rev: Option<String>,
@@ -151,12 +160,15 @@ fn main() -> Result<()> {
             spec,
             message,
             spec_file,
+            query,
             rev,
         } => {
-            let (spec, message) = normalize_spec_message(spec, message, &spec_file, "split")?;
+            let (spec, message) =
+                normalize_selection_message(spec, message, &spec_file, query.as_deref(), "split")?;
             commands::split(
                 spec.as_deref(),
                 spec_file.as_deref(),
+                query.as_deref(),
                 &message,
                 rev.as_deref(),
             )
@@ -165,27 +177,53 @@ fn main() -> Result<()> {
             spec,
             message,
             spec_file,
+            query,
         } => {
-            let (spec, message) = normalize_spec_message(spec, message, &spec_file, "commit")?;
-            commands::commit(spec.as_deref(), spec_file.as_deref(), &message)
+            let (spec, message) =
+                normalize_selection_message(spec, message, &spec_file, query.as_deref(), "commit")?;
+            commands::commit(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                query.as_deref(),
+                &message,
+            )
         }
         Commands::Squash {
             spec,
             spec_file,
+            query,
             rev,
         } => {
-            let spec = normalize_spec_only(spec, &spec_file, "squash")?;
-            commands::squash(spec.as_deref(), spec_file.as_deref(), rev.as_deref())
+            let spec = normalize_selection_only(spec, &spec_file, query.as_deref(), "squash")?;
+            commands::squash(
+                spec.as_deref(),
+                spec_file.as_deref(),
+                query.as_deref(),
+                rev.as_deref(),
+            )
         }
     }
 }
 
-fn normalize_spec_message(
+fn normalize_selection_message(
     mut spec: Option<String>,
     mut message: Option<String>,
     spec_file: &Option<String>,
+    query: Option<&str>,
     command: &str,
 ) -> Result<(Option<String>, String)> {
+    if query.is_some() {
+        if spec_file.is_some() {
+            anyhow::bail!("{command}: --query cannot be combined with --spec-file");
+        }
+        return match (spec, message) {
+            (Some(message), None) | (None, Some(message)) => Ok((None, message)),
+            (Some(_), Some(_)) => anyhow::bail!(
+                "{command}: --query accepts only a commit message, not a selection spec"
+            ),
+            (None, None) => anyhow::bail!("{command} requires a commit message"),
+        };
+    }
     if spec_file.is_some() && message.is_none() {
         message = spec.take();
     }
@@ -204,11 +242,18 @@ fn normalize_spec_message(
     Ok((Some(spec), message))
 }
 
-fn normalize_spec_only(
+fn normalize_selection_only(
     spec: Option<String>,
     spec_file: &Option<String>,
+    query: Option<&str>,
     command: &str,
 ) -> Result<Option<String>> {
+    if query.is_some() {
+        if spec.is_some() || spec_file.is_some() {
+            anyhow::bail!("{command}: --query cannot be combined with a selection spec");
+        }
+        return Ok(None);
+    }
     if spec_file.is_some() {
         if spec.is_some() {
             anyhow::bail!("{command}: omit <spec> when using --spec-file");

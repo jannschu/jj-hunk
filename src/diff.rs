@@ -1,4 +1,4 @@
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
@@ -7,14 +7,14 @@ use std::fmt::Write;
 pub const HUNK_ID_PREFIX: &str = "hunk-";
 const CONTEXT_LINES: usize = 3;
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct LineRange {
     pub start: usize,
     #[serde(rename = "lines")]
     pub length: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct HunkContext {
     #[serde(rename = "pre")]
     pub before: String,
@@ -22,7 +22,7 @@ pub struct HunkContext {
     pub after: String,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Hunk {
     pub index: usize,
     pub id: String,
@@ -277,7 +277,12 @@ fn determine_hunk_type(removed: &str, added: &str) -> &'static str {
     }
 }
 
-fn compute_hunk_id(hunk_type: &str, removed: &str, added: &str, context: Option<&HunkContext>) -> String {
+fn compute_hunk_id(
+    hunk_type: &str,
+    removed: &str,
+    added: &str,
+    context: Option<&HunkContext>,
+) -> String {
     let mut hasher = Sha256::new();
     hasher.update(b"type\0");
     hasher.update(hunk_type.as_bytes());
@@ -334,10 +339,7 @@ fn build_context(before_lines: &[&str], before_range: &LineRange) -> Option<Hunk
         return None;
     }
 
-    let start_idx = before_range
-        .start
-        .saturating_sub(1)
-        .min(before_lines.len());
+    let start_idx = before_range.start.saturating_sub(1).min(before_lines.len());
     let before_start = start_idx.saturating_sub(CONTEXT_LINES);
     let before_slice = before_lines.get(before_start..start_idx).unwrap_or(&[]);
     let after_start = (start_idx + before_range.length).min(before_lines.len());
@@ -449,9 +451,18 @@ mod tests {
         let hex = id.strip_prefix(HUNK_ID_PREFIX).unwrap();
         let expected = format!("{HUNK_ID_PREFIX}{hex}");
 
-        assert_eq!(normalize_hunk_id(&format!("id:{hex}")).as_deref(), Some(expected.as_str()));
-        assert_eq!(normalize_hunk_id(&format!("sha:{hex}")).as_deref(), Some(expected.as_str()));
-        assert_eq!(normalize_hunk_id(&format!("sha256:{hex}")).as_deref(), Some(expected.as_str()));
+        assert_eq!(
+            normalize_hunk_id(&format!("id:{hex}")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            normalize_hunk_id(&format!("sha:{hex}")).as_deref(),
+            Some(expected.as_str())
+        );
+        assert_eq!(
+            normalize_hunk_id(&format!("sha256:{hex}")).as_deref(),
+            Some(expected.as_str())
+        );
         assert_eq!(normalize_hunk_id(hex).as_deref(), Some(expected.as_str()));
     }
 }

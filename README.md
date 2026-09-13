@@ -34,6 +34,9 @@ jj-hunk list --format yaml
 # Select whole text blocks with a query; revision scope stays separate
 jj-hunk list -r @ --query 'files("src/**") & content("timeout")'
 
+# Apply the same query selection while the other changes stay in the working copy
+jj-hunk commit --query 'files("src/fix.rs")' "bug fix"
+
 # List files only (hunk counts)
 jj-hunk list --files
 
@@ -68,8 +71,11 @@ cat spec.json | jj-hunk commit - "bug fix"
 |---------|-------------|
 | `jj-hunk list [options]` | List hunks, files, or spec templates |
 | `jj-hunk split [-r rev] <spec> <message>` | Split changes into two commits |
+| `jj-hunk split [-r rev] --query <expression> <message>` | Split query-selected occurrences |
 | `jj-hunk commit <spec> <message>` | Commit selected hunks |
+| `jj-hunk commit --query <expression> <message>` | Commit query-selected occurrences |
 | `jj-hunk squash [-r rev] <spec>` | Squash selected hunks into parent |
+| `jj-hunk squash [-r rev] --query <expression>` | Squash query-selected occurrences |
 
 Split and squash accept `-r <rev>` to target any revision (default: `@`). Commit always operates on the working copy.
 
@@ -86,6 +92,8 @@ List options:
 - `--spec-template` — emit a spec template (JSON/YAML only)
 
 `<spec>` may be an inline JSON/YAML string or `-` to read from stdin. Use `--spec-file <path>` to read a JSON/YAML file (omit `<spec>` when using `--spec-file`).
+
+Mutation commands accept `--query` as an alternative to a spec. Query evaluation uses the complete materialized diff. A valid query that selects no occurrences is a no-op for split, commit, and squash; it does not select all changes. Query and spec inputs cannot be combined.
 
 ## Spec Format
 

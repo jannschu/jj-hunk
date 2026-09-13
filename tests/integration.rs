@@ -529,6 +529,313 @@ fn commit_self_configures_jj_hunk_tool_when_user_config_is_empty() {
     );
 }
 
+#[test]
+fn query_empty_selection_is_a_no_op_for_all_mutation_commands() {
+    let repo = TestRepo::new("query-empty-mutations");
+    repo.write_file("base.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("base.txt", "new\n");
+    repo.write_file("created.txt", "created\n");
+
+    let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let diff_before = repo.jj_ok(&["diff", "--git"]);
+    repo.hunk_ok(&["commit", "--query", "none()", "empty commit"]);
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+
+    repo.hunk_ok(&["split", "--query", "none()", "empty split"]);
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+
+    repo.hunk_ok(&["squash", "--query", "none()"]);
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+}
+
+#[test]
+fn mutation_queries_reject_ambiguous_selection_inputs() {
+    let repo = TestRepo::new("query-ambiguous-mutations");
+    repo.write_file("changed.txt", "changed\n");
+
+    for args in [
+        ["split", "--query", "all()", "spec", "message"].as_slice(),
+        ["commit", "--query", "all()", "spec", "message"].as_slice(),
+        ["squash", "--query", "all()", "spec"].as_slice(),
+    ] {
+        let error = repo.hunk_fail(args);
+        assert!(
+            error.contains("selection spec"),
+            "unexpected error for {args:?}: {error}"
+        );
+    }
+}
+
+#[test]
+fn empty_text_list_output_is_valid() {
+    let repo = TestRepo::new("empty-text-list");
+    repo.write_file("base.txt", "base\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    assert_eq!(repo.hunk_ok(&["list", "--format", "text"]), "");
+    repo.write_file("base.txt", "changed\n");
+    assert_eq!(
+        repo.hunk_ok(&["list", "--format", "text", "--query", "none()"]),
+        ""
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn mutation_query_rejects_unsupported_input_before_writes() {
+    let repo = TestRepo::new("query-unsupported-mutation");
+    repo.write_file("base.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("base.txt", "new\n");
+    std::os::unix::fs::symlink("base.txt", repo.path().join("link.txt")).unwrap();
+
+    let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let diff_before = repo.jj_ok(&["diff", "--git"]);
+    let error = repo.hunk_fail(&["commit", "--query", "all()", "must fail"]);
+
+    assert!(error.contains("special-file changes"), "{error}");
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+}
+
+#[cfg(unix)]
+#[test]
+fn binary_query_keeps_unselected_mode_change() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("query-binary-with-mode");
+    repo.write_file("tool.bin", "old\0bytes");
+    let path = repo.path().join("tool.bin");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    repo.write_file("tool.bin", "new\0bytes");
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o644);
+    std::fs::set_permissions(&path, permissions).unwrap();
+    repo.hunk_ok(&["commit", "--query", "binaries()", "binary only"]);
+
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", "@-", "tool.bin"]).stdout,
+        b"new\0bytes"
+    );
+    assert!(!repo
+        .jj_ok(&["diff", "--git", "-r", "@-"])
+        .contains("mode 100644"));
+    let remaining = repo.jj_ok(&["diff", "--git", "-r", "@"]);
+    assert!(remaining.contains("old mode 100755"), "{remaining}");
+    assert!(remaining.contains("new mode 100644"), "{remaining}");
+}
+
+#[test]
+fn creation_query_rejects_retained_directory_collision_without_writes() {
+    let repo = TestRepo::new("query-retained-directory-collision");
+    repo.write_file("item/retained.txt", "keep\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("item/retained.txt")).unwrap();
+    std::fs::remove_dir(repo.path().join("item")).unwrap();
+    repo.write_file("item", "replacement\n");
+
+    let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let diff_before = repo.jj_ok(&["diff", "--git"]);
+    let error = repo.hunk_fail(&["commit", "--query", "creations()", "must fail"]);
+
+    assert!(error.contains("collides with a retained path"), "{error}");
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+}
+
+#[test]
+fn commit_query_selects_creation_and_leaves_other_changes() {
+    let repo = TestRepo::new("commit-query");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("selected.txt", "selected\n");
+    repo.write_file("remaining.txt", "remaining\n");
+
+    repo.hunk_ok(&[
+        "commit",
+        "--query",
+        "files(\"selected.txt\") & creations()",
+        "selected creation",
+    ]);
+
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "selected.txt"]),
+        "selected\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "remaining.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@", "remaining.txt"]),
+        "remaining\n"
+    );
+    assert_eq!(repo.changed_files("@"), vec!["A remaining.txt"]);
+}
+
+fn prepare_edited_rename(repo: &TestRepo) {
+    repo.write_file("src/client.rs", "header\ntimeout = 10\nfooter\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::create_dir_all(repo.path().join("archive")).unwrap();
+    std::fs::rename(
+        repo.path().join("src/client.rs"),
+        repo.path().join("archive/client.rs"),
+    )
+    .unwrap();
+    repo.write_file("archive/client.rs", "header\ntimeout = 20\nfooter\n");
+}
+
+#[test]
+fn split_query_rename_only_keeps_old_content() {
+    let repo = TestRepo::new("split-query-rename-only");
+    prepare_edited_rename(&repo);
+
+    repo.hunk_ok(&["split", "--query", "renames()", "rename only"]);
+    let revision = repo
+        .jj_ok(&[
+            "log",
+            "--no-graph",
+            "-r",
+            "description(substring:\"rename only\")",
+            "-T",
+            "change_id",
+        ])
+        .trim()
+        .to_owned();
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", &revision, "archive/client.rs"]),
+        "header\ntimeout = 10\nfooter\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", &revision, "src/client.rs"])
+        .status
+        .success());
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@", "archive/client.rs"]),
+        "header\ntimeout = 20\nfooter\n"
+    );
+}
+
+#[test]
+fn commit_query_text_only_keeps_old_path() {
+    let repo = TestRepo::new("commit-query-text-only");
+    prepare_edited_rename(&repo);
+
+    repo.hunk_ok(&["commit", "--query", "content(\"timeout\")", "text only"]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/client.rs"]),
+        "header\ntimeout = 20\nfooter\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "archive/client.rs"])
+        .status
+        .success());
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@", "archive/client.rs"]),
+        "header\ntimeout = 20\nfooter\n"
+    );
+}
+
+#[test]
+fn squash_query_combined_rename_and_text_applies_both() {
+    let repo = TestRepo::new("squash-query-combined");
+    prepare_edited_rename(&repo);
+
+    repo.hunk_ok(&["squash", "--query", "renames() | content(\"timeout\")"]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "archive/client.rs"]),
+        "header\ntimeout = 20\nfooter\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "src/client.rs"])
+        .status
+        .success());
+    assert!(repo.changed_files("@").is_empty());
+}
+
+#[cfg(unix)]
+#[test]
+fn commit_query_applies_file_units_and_preserves_unselected_text() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("commit-query-file-units");
+    repo.write_file("deleted.txt", "deleted\n");
+    repo.write_file("empty-deleted.txt", "");
+    repo.write_file("binary.bin", "old\0bytes");
+    repo.write_file("mode.sh", "unchanged\n");
+    repo.write_file("remaining.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+
+    std::fs::remove_file(repo.path().join("deleted.txt")).unwrap();
+    std::fs::remove_file(repo.path().join("empty-deleted.txt")).unwrap();
+    repo.write_file("created.txt", "created\n");
+    repo.write_file("empty-created.txt", "");
+    repo.write_file("binary.bin", "new\0bytes");
+    repo.write_file("remaining.txt", "new\n");
+    let mode_path = repo.path().join("mode.sh");
+    let mut permissions = std::fs::metadata(&mode_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(mode_path, permissions).unwrap();
+
+    repo.hunk_ok(&[
+        "commit",
+        "--query",
+        "creations() | deletions() | binaries() | modes()",
+        "file units",
+    ]);
+
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "created.txt"]),
+        "created\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "empty-created.txt"]),
+        ""
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "deleted.txt"])
+        .status
+        .success());
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "empty-deleted.txt"])
+        .status
+        .success());
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", "@-", "binary.bin"]).stdout,
+        b"new\0bytes"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "remaining.txt"]),
+        "old\n"
+    );
+    assert!(repo
+        .jj_ok(&["diff", "--git", "-r", "@-"])
+        .contains("new mode 100755"));
+    assert_eq!(repo.changed_files("@"), vec!["M remaining.txt"]);
+}
+
 // ---------------------------------------------------------------------------
 // error cases
 // ---------------------------------------------------------------------------

@@ -6,7 +6,7 @@ use hunkset::{evaluate, OccurrenceKey, SelectableUnit};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::Path;
 use std::process::Command;
 use walkdir::WalkDir;
@@ -17,6 +17,7 @@ const JJ_HUNK_EDIT_ARGS_KEY: &str = "merge-tools.jj-hunk.edit-args";
 const JJ_HUNK_LIST_REQUEST: &str = "JJ_HUNK_LIST_REQUEST";
 const JJ_HUNK_LIST_OUTPUT: &str = "JJ_HUNK_LIST_OUTPUT";
 const JJ_HUNK_LIST_TOOL: &str = "jj-hunk-list";
+const JJ_HUNK_QUERY_REQUEST: &str = "JJ_HUNK_QUERY_REQUEST";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum ListFormat {
@@ -115,7 +116,7 @@ impl From<Option<&str>> for ListOptions {
     }
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ListOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     files: Option<Vec<FileEntry>>,
@@ -123,13 +124,13 @@ struct ListOutput {
     groups: Option<Vec<ListGroup>>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct ListGroup {
     name: String,
     files: Vec<FileEntry>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Deserialize, Serialize)]
 struct FileEntry {
     path: String,
     status: String,
@@ -144,7 +145,7 @@ struct FileEntry {
     truncated: Option<bool>,
 }
 
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct FileUnitOutput {
     kind: FileUnitKind,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -157,7 +158,7 @@ struct FileUnitOutput {
     added: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "lowercase")]
 enum FileUnitKind {
     Creation,
@@ -167,7 +168,7 @@ enum FileUnitKind {
     Binary,
 }
 
-#[derive(Debug, Serialize, Clone)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 struct RenameInfo {
     from: String,
     to: String,
@@ -213,7 +214,7 @@ enum SpecTemplateEntry {
     Action { action: String },
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct DiffSummaryEntry {
     status: String,
     path: String,
@@ -235,7 +236,7 @@ struct DiffSummaryEntry {
     target_conflict: bool,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct ListRequest {
     options: ListOptions,
     summary_entries: Vec<DiffSummaryEntry>,
@@ -284,118 +285,7 @@ fn render_materialized_list(
     before_root: &Path,
     after_root: &Path,
 ) -> Result<String> {
-    let options = request.options;
-    let spec = options.spec.as_deref().map(Spec::from_str).transpose()?;
-
-    let include = normalize_patterns(&options.include);
-    let exclude = normalize_patterns(&options.exclude);
-
-    let mut files = Vec::new();
-    let query = options.query.as_deref();
-
-    for entry in request.summary_entries {
-        let path = primary_path(&entry);
-        if path.is_empty() {
-            continue;
-        }
-
-        if !should_include_entry(&entry, &include, &exclude) {
-            continue;
-        }
-
-        let decision = spec_decision(spec.as_ref(), &path);
-        if matches!(decision, SpecDecision::Skip) {
-            continue;
-        }
-
-        let file_paths = file_paths_for_entry(&entry, &path);
-        let before_bytes = read_materialized_file(before_root, file_paths.before.as_deref())?;
-        let after_bytes = read_materialized_file(after_root, file_paths.after.as_deref())?;
-
-        let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
-        let binary_changed = is_binary && before_bytes != after_bytes;
-        let mode_changed = entry.source_executable != entry.target_executable;
-        if query.is_some() {
-            validate_query_entry(&entry, &path)?;
-        }
-        if query.is_none() && is_binary && options.binary == BinaryMode::Skip {
-            continue;
-        }
-
-        let should_diff = if query.is_some() {
-            !is_binary
-        } else {
-            !(is_binary && options.binary == BinaryMode::Mark)
-        };
-        let (before_text, before_truncated) = if should_diff && query.is_none() {
-            truncate_text(
-                &String::from_utf8_lossy(&before_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else if should_diff {
-            (String::from_utf8_lossy(&before_bytes).into_owned(), false)
-        } else {
-            (String::new(), false)
-        };
-        let (after_text, after_truncated) = if should_diff && query.is_none() {
-            truncate_text(
-                &String::from_utf8_lossy(&after_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else if should_diff {
-            (String::from_utf8_lossy(&after_bytes).into_owned(), false)
-        } else {
-            (String::new(), false)
-        };
-
-        let mut hunks = if should_diff
-            && !(query.is_some() && matches!(entry.status.as_str(), "added" | "removed"))
-        {
-            get_hunks(&before_text, &after_text)
-        } else {
-            Vec::new()
-        };
-
-        if let SpecDecision::KeepSelection(selection) = &decision {
-            hunks = filter_hunks(hunks, selection);
-        }
-
-        let file_units = if query.is_some() {
-            prepare_file_units(
-                &entry,
-                &file_paths,
-                &before_text,
-                &after_text,
-                binary_changed,
-                mode_changed,
-            )
-        } else {
-            Vec::new()
-        };
-
-        if hunks.is_empty() && !is_binary && file_units.is_empty() {
-            continue;
-        }
-
-        let rename = rename_info(&entry);
-        let truncated = before_truncated || after_truncated;
-
-        files.push(FileEntry {
-            path,
-            status: entry.status.clone(),
-            rename,
-            hunks,
-            file_units,
-            binary: if is_binary { Some(true) } else { None },
-            truncated: if truncated { Some(true) } else { None },
-        });
-    }
-
-    if let Some(query) = query {
-        filter_files_by_query(&mut files, query, options.max_bytes, options.max_lines)?;
-    }
+    let (options, files) = prepare_list(request, before_root, after_root)?;
 
     match options.mode {
         ListMode::Full => {
@@ -440,6 +330,110 @@ fn render_materialized_list(
     }
 }
 
+fn prepare_list(
+    request: ListRequest,
+    before_root: &Path,
+    after_root: &Path,
+) -> Result<(ListOptions, Vec<FileEntry>)> {
+    let options = request.options;
+    let spec = options.spec.as_deref().map(Spec::from_str).transpose()?;
+    let include = normalize_patterns(&options.include);
+    let exclude = normalize_patterns(&options.exclude);
+    let query = options.query.as_deref();
+    let mut files = Vec::new();
+
+    for entry in request.summary_entries {
+        let path = primary_path(&entry);
+        if path.is_empty() || !should_include_entry(&entry, &include, &exclude) {
+            continue;
+        }
+        let decision = spec_decision(spec.as_ref(), &path);
+        if matches!(decision, SpecDecision::Skip) {
+            continue;
+        }
+
+        let file_paths = file_paths_for_entry(&entry, &path);
+        if query.is_some() {
+            validate_query_entry(&entry, &path)?;
+            validate_materialized_entry(&entry, &file_paths, before_root, after_root)?;
+        }
+        let before_bytes = read_materialized_file(before_root, file_paths.before.as_deref())?;
+        let after_bytes = read_materialized_file(after_root, file_paths.after.as_deref())?;
+        let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
+        let binary_changed = is_binary && before_bytes != after_bytes;
+        let mode_changed = entry.source_executable != entry.target_executable;
+        if query.is_none() && is_binary && options.binary == BinaryMode::Skip {
+            continue;
+        }
+
+        let should_diff = if query.is_some() {
+            !is_binary
+        } else {
+            !(is_binary && options.binary == BinaryMode::Mark)
+        };
+        let (before_text, before_truncated) = if should_diff && query.is_none() {
+            truncate_text(
+                &String::from_utf8_lossy(&before_bytes),
+                options.max_bytes,
+                options.max_lines,
+            )
+        } else if should_diff {
+            (String::from_utf8_lossy(&before_bytes).into_owned(), false)
+        } else {
+            (String::new(), false)
+        };
+        let (after_text, after_truncated) = if should_diff && query.is_none() {
+            truncate_text(
+                &String::from_utf8_lossy(&after_bytes),
+                options.max_bytes,
+                options.max_lines,
+            )
+        } else if should_diff {
+            (String::from_utf8_lossy(&after_bytes).into_owned(), false)
+        } else {
+            (String::new(), false)
+        };
+        let mut hunks = if should_diff
+            && !(query.is_some() && matches!(entry.status.as_str(), "added" | "removed"))
+        {
+            get_hunks(&before_text, &after_text)
+        } else {
+            Vec::new()
+        };
+        if let SpecDecision::KeepSelection(selection) = &decision {
+            hunks = filter_hunks(hunks, selection);
+        }
+        let file_units = if query.is_some() {
+            prepare_file_units(
+                &entry,
+                &file_paths,
+                &before_text,
+                &after_text,
+                binary_changed,
+                mode_changed,
+            )
+        } else {
+            Vec::new()
+        };
+        if hunks.is_empty() && !is_binary && file_units.is_empty() {
+            continue;
+        }
+        files.push(FileEntry {
+            path,
+            status: entry.status.clone(),
+            rename: rename_info(&entry),
+            hunks,
+            file_units,
+            binary: is_binary.then_some(true),
+            truncated: (before_truncated || after_truncated).then_some(true),
+        });
+    }
+    if let Some(query) = query {
+        filter_files_by_query(&mut files, query, options.max_bytes, options.max_lines)?;
+    }
+    Ok((options, files))
+}
+
 fn validate_query_options(options: &ListOptions) -> Result<()> {
     let Some(query) = options.query.as_deref() else {
         return Ok(());
@@ -473,6 +467,70 @@ fn validate_query_entry(entry: &DiffSummaryEntry, path: &str) -> Result<()> {
     };
     if !supported_types {
         anyhow::bail!("query preview does not support special-file changes: {path}");
+    }
+    Ok(())
+}
+
+fn validate_materialized_entry(
+    entry: &DiffSummaryEntry,
+    paths: &FilePaths,
+    before_root: &Path,
+    after_root: &Path,
+) -> Result<()> {
+    validate_materialized_file(
+        before_root,
+        paths.before.as_deref(),
+        entry.source_executable,
+    )?;
+    validate_materialized_file(after_root, paths.after.as_deref(), entry.target_executable)?;
+    Ok(())
+}
+
+fn validate_materialized_file(
+    root: &Path,
+    path: Option<&str>,
+    expected_executable: bool,
+) -> Result<()> {
+    let Some(path) = path else {
+        return Ok(());
+    };
+    let materialized = root.join(path);
+    let metadata = fs::symlink_metadata(&materialized).with_context(|| {
+        format!("query materialization does not match diff metadata: missing {path}")
+    })?;
+    if !metadata.file_type().is_file() {
+        anyhow::bail!(
+            "query materialization does not match diff metadata: {path} is not a regular file"
+        );
+    }
+    validate_materialized_executable(path, &metadata, expected_executable)
+}
+
+#[cfg(unix)]
+fn validate_materialized_executable(
+    path: &str,
+    metadata: &fs::Metadata,
+    expected: bool,
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let actual = metadata.permissions().mode() & 0o111 != 0;
+    if actual != expected {
+        anyhow::bail!(
+            "query materialization does not match diff metadata: executable state differs for {path}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn validate_materialized_executable(
+    _path: &str,
+    _metadata: &fs::Metadata,
+    expected: bool,
+) -> Result<()> {
+    if expected {
+        anyhow::bail!("query application cannot verify executable files on this platform");
     }
     Ok(())
 }
@@ -717,15 +775,14 @@ fn resolve_optional_spec(spec: Option<&str>, spec_file: Option<&str>) -> Result<
 }
 
 fn run_materialized_list(request: &ListRequest, revset: Option<&str>) -> Result<String> {
-    let temp_dir = std::env::temp_dir();
-    let process_id = std::process::id();
-    let request_path = temp_dir.join(format!("jj-hunk-{process_id}.list-request"));
-    let output_path = temp_dir.join(format!("jj-hunk-{process_id}.list-output"));
-
-    fs::remove_file(&request_path).ok();
-    fs::remove_file(&output_path).ok();
+    let temp_dir = tempfile::Builder::new()
+        .prefix("jj-hunk-list-")
+        .tempdir()
+        .context("Failed to reserve list exchange directory")?;
+    let request_path = temp_dir.path().join("request.json");
+    let output_path = temp_dir.path().join("output");
     fs::write(&request_path, serde_json::to_vec(request)?)
-        .with_context(|| format!("Failed to write list request to {}", request_path.display()))?;
+        .context("Failed to write list request")?;
 
     let result = (|| {
         let program = std::env::current_exe()
@@ -776,8 +833,6 @@ fn run_materialized_list(request: &ListRequest, revset: Option<&str>) -> Result<
             .with_context(|| format!("Failed to read list output from {}", output_path.display()))
     })();
 
-    fs::remove_file(&request_path).ok();
-    fs::remove_file(&output_path).ok();
     result
 }
 
@@ -1367,6 +1422,15 @@ fn status_char(status: &str) -> &'static str {
 
 /// Select hunks (called by jj --tool)
 pub fn select(left: &str, right: &str) -> Result<()> {
+    if let Ok(path) = std::env::var(JJ_HUNK_QUERY_REQUEST) {
+        let request: ListRequest = serde_json::from_slice(
+            &fs::read(&path)
+                .with_context(|| format!("Failed to read query request from {path}"))?,
+        )
+        .context("Failed to parse query request")?;
+        return apply_query_selection(request, Path::new(left), Path::new(right));
+    }
+
     let spec_path = std::env::var("JJ_HUNK_SELECTION").ok();
 
     let spec = if let Some(path) = spec_path {
@@ -1413,6 +1477,326 @@ pub fn select(left: &str, right: &str) -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+fn apply_query_selection(request: ListRequest, left_root: &Path, right_root: &Path) -> Result<()> {
+    let (_, selected_files) = prepare_list(request.clone(), left_root, right_root)?;
+
+    let selected_by_path = selected_files
+        .into_iter()
+        .map(|file| (file.path.clone(), file))
+        .collect::<HashMap<_, _>>();
+    let owned_root = create_owned_staging_root(right_root)?;
+    let stage_root = owned_root.path().join("stage");
+    let backup_root = owned_root.path().join("backup");
+    copy_tree(left_root, &stage_root)?;
+
+    let preparation = (|| {
+        let mut claimed_paths = HashMap::<String, String>::new();
+        for entry in &request.summary_entries {
+            let path = primary_path(entry);
+            let Some(selected) = selected_by_path.get(&path) else {
+                continue;
+            };
+            apply_selected_entry(
+                entry,
+                selected,
+                left_root,
+                right_root,
+                &stage_root,
+                &mut claimed_paths,
+            )?;
+        }
+        Ok(())
+    })();
+    if let Err(error) = preparation {
+        return Err(error);
+    }
+
+    install_prepared_tree(owned_root, &stage_root, right_root, &backup_root)
+}
+
+fn install_prepared_tree(
+    owned_root: tempfile::TempDir,
+    stage_root: &Path,
+    right_root: &Path,
+    backup_root: &Path,
+) -> Result<()> {
+    if let Err(error) = fs::rename(right_root, backup_root) {
+        return Err(error).with_context(|| {
+            format!(
+                "Failed to preserve selection output at {}",
+                right_root.display()
+            )
+        });
+    }
+    if let Err(error) = fs::rename(stage_root, right_root) {
+        return match fs::rename(backup_root, right_root) {
+            Ok(()) => Err(error).context(
+                "Failed to install prepared query selection; restored the original output",
+            ),
+            Err(rollback_error) => {
+                let recovery_root = owned_root.keep();
+                anyhow::bail!(
+                    "Failed to install prepared query selection: {error}; failed to restore the original output: {rollback_error}; original output is preserved at {}",
+                    recovery_root.join("backup").display()
+                )
+            }
+        };
+    }
+    remove_path_if_present(backup_root).ok();
+    Ok(())
+}
+
+fn apply_selected_entry(
+    entry: &DiffSummaryEntry,
+    selected: &FileEntry,
+    left_root: &Path,
+    right_root: &Path,
+    stage_root: &Path,
+    claimed_paths: &mut HashMap<String, String>,
+) -> Result<()> {
+    let paths = file_paths_for_entry(entry, &selected.path);
+    let selected_kind = |kind| selected.file_units.iter().any(|unit| unit.kind == kind);
+    let creation_selected = selected_kind(FileUnitKind::Creation);
+    let deletion_selected = selected_kind(FileUnitKind::Deletion);
+    let rename_selected = selected_kind(FileUnitKind::Rename);
+    let mode_selected = selected_kind(FileUnitKind::Mode);
+    let binary_selected = selected_kind(FileUnitKind::Binary);
+    let text_selected = !selected.hunks.is_empty();
+
+    match entry.status.as_str() {
+        "added" if creation_selected || binary_selected => {
+            let target = paths.after.as_deref().expect("addition has target path");
+            claim_path(claimed_paths, target, &selected.path)?;
+            require_new_destination(stage_root, target)?;
+            copy_path(right_root, stage_root, target, target)?;
+        }
+        "removed" if deletion_selected || binary_selected => {
+            let source = paths.before.as_deref().expect("deletion has source path");
+            remove_path_if_present(&stage_root.join(source))?;
+        }
+        "renamed" => {
+            let source = paths.before.as_deref().expect("rename has source path");
+            let target = paths.after.as_deref().expect("rename has target path");
+            let destination = if rename_selected { target } else { source };
+            if rename_selected && target != source {
+                require_new_destination(stage_root, target)?;
+            }
+            claim_path(claimed_paths, destination, &selected.path)?;
+
+            if rename_selected {
+                remove_path_if_present(&stage_root.join(source))?;
+            }
+            if binary_selected {
+                copy_path(right_root, stage_root, target, destination)?;
+                if !mode_selected {
+                    copy_permissions(left_root, stage_root, source, destination)?;
+                }
+            } else if text_selected {
+                write_selected_text(
+                    left_root,
+                    right_root,
+                    stage_root,
+                    source,
+                    target,
+                    destination,
+                    &selected.hunks,
+                )?;
+            } else if rename_selected {
+                copy_path(left_root, stage_root, source, destination)?;
+            }
+            if mode_selected {
+                copy_permissions(right_root, stage_root, target, destination)?;
+            }
+        }
+        "modified" => {
+            let path = paths
+                .after
+                .as_deref()
+                .expect("modification has target path");
+            claim_path(claimed_paths, path, &selected.path)?;
+            if binary_selected {
+                copy_path(right_root, stage_root, path, path)?;
+                if !mode_selected {
+                    copy_permissions(left_root, stage_root, path, path)?;
+                }
+            } else if text_selected {
+                write_selected_text(
+                    left_root,
+                    right_root,
+                    stage_root,
+                    path,
+                    path,
+                    path,
+                    &selected.hunks,
+                )?;
+            }
+            if mode_selected {
+                copy_permissions(right_root, stage_root, path, path)?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn write_selected_text(
+    left_root: &Path,
+    right_root: &Path,
+    stage_root: &Path,
+    source: &str,
+    target: &str,
+    destination: &str,
+    hunks: &[Hunk],
+) -> Result<()> {
+    let before = fs::read_to_string(left_root.join(source))?;
+    let after = fs::read_to_string(right_root.join(target))?;
+    let selection = HunkSelection {
+        indices: hunks.iter().map(|hunk| hunk.index).collect(),
+        ids: HashSet::new(),
+    };
+    let content = apply_selected_hunks(&before, &after, &selection);
+    let destination = stage_root.join(destination);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_present(&destination)?;
+    fs::write(&destination, content)?;
+    fs::set_permissions(
+        &destination,
+        fs::metadata(left_root.join(source))?.permissions(),
+    )?;
+    Ok(())
+}
+
+fn claim_path(claimed: &mut HashMap<String, String>, path: &str, source: &str) -> Result<()> {
+    if let Some((existing_path, existing_source)) = claimed.iter().find(|(existing_path, _)| {
+        path != existing_path.as_str()
+            && (path.starts_with(&format!("{existing_path}/"))
+                || existing_path.starts_with(&format!("{path}/")))
+    }) {
+        anyhow::bail!(
+            "query selection has overlapping outputs for {path} and {existing_path}: {source} and {existing_source}"
+        );
+    }
+    if let Some(existing) = claimed.insert(path.to_owned(), source.to_owned()) {
+        if existing != source {
+            anyhow::bail!(
+                "query selection has conflicting outputs for {path}: {existing} and {source}"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn require_new_destination(stage_root: &Path, path: &str) -> Result<()> {
+    let destination = stage_root.join(path);
+    if fs::symlink_metadata(&destination).is_ok() {
+        anyhow::bail!("query output collides with a retained path: {path}");
+    }
+    let mut parent = destination.parent();
+    while let Some(candidate) = parent {
+        if candidate == stage_root {
+            break;
+        }
+        match fs::symlink_metadata(candidate) {
+            Ok(metadata) if !metadata.is_dir() => {
+                anyhow::bail!(
+                    "query output {path} has a retained non-directory ancestor: {}",
+                    candidate.display()
+                );
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+        parent = candidate.parent();
+    }
+    Ok(())
+}
+
+fn copy_path(
+    source_root: &Path,
+    destination_root: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<()> {
+    let destination = destination_root.join(destination);
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    remove_path_if_present(&destination)?;
+    fs::copy(source_root.join(source), &destination)?;
+    Ok(())
+}
+
+fn copy_permissions(
+    source_root: &Path,
+    destination_root: &Path,
+    source: &str,
+    destination: &str,
+) -> Result<()> {
+    let permissions = fs::metadata(source_root.join(source))?.permissions();
+    fs::set_permissions(destination_root.join(destination), permissions)?;
+    Ok(())
+}
+
+fn copy_tree(source_root: &Path, destination_root: &Path) -> Result<()> {
+    fs::create_dir_all(destination_root)?;
+    for entry in WalkDir::new(source_root) {
+        let entry = entry?;
+        let relative = entry.path().strip_prefix(source_root)?;
+        let destination = destination_root.join(relative);
+        if entry.file_type().is_dir() {
+            fs::create_dir_all(&destination)?;
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = destination.parent() {
+                fs::create_dir_all(parent)?;
+            }
+            fs::copy(entry.path(), destination)?;
+        } else if entry.file_type().is_symlink() {
+            copy_symlink(entry.path(), &destination)?;
+        }
+    }
+    Ok(())
+}
+
+fn create_owned_staging_root(right_root: &Path) -> Result<tempfile::TempDir> {
+    let parent = right_root
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("selection output has no parent directory"))?;
+    tempfile::Builder::new()
+        .prefix(".jj-hunk-selection-")
+        .tempdir_in(parent)
+        .context("Failed to reserve query staging directory")
+}
+
+#[cfg(unix)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    std::os::unix::fs::symlink(fs::read_link(source)?, destination)?;
+    Ok(())
+}
+
+#[cfg(windows)]
+fn copy_symlink(source: &Path, destination: &Path) -> Result<()> {
+    let target = fs::read_link(source)?;
+    if source.is_dir() {
+        std::os::windows::fs::symlink_dir(target, destination)?;
+    } else {
+        std::os::windows::fs::symlink_file(target, destination)?;
+    }
+    Ok(())
+}
+
+fn remove_path_if_present(path: &Path) -> Result<()> {
+    match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
     Ok(())
 }
 
@@ -1501,22 +1885,75 @@ fn resolve_spec_input(spec: Option<&str>, spec_file: Option<&str>) -> Result<Str
     Ok(spec.to_string())
 }
 
-fn run_jj_with_selection(args: &[&str], spec: Option<&str>, spec_file: Option<&str>) -> Result<()> {
+fn run_jj_with_selection(
+    args: &[&str],
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    query: Option<&str>,
+    rev: Option<&str>,
+) -> Result<()> {
+    if let Some(query) = query {
+        return run_jj_with_query(args, query, rev);
+    }
     let spec_content = resolve_spec_input(spec, spec_file)?;
-    let temp_file = std::env::temp_dir().join(format!("jj-hunk-{}.spec", std::process::id()));
-    fs::write(&temp_file, spec_content)?;
+    let mut temp_file = tempfile::Builder::new()
+        .prefix("jj-hunk-spec-")
+        .tempfile()
+        .context("Failed to reserve spec file")?;
+    temp_file
+        .write_all(spec_content.as_bytes())
+        .context("Failed to write spec file")?;
 
     let config_args = jj_hunk_tool_config_args()?;
 
     let status = Command::new("jj")
         .args(&config_args)
         .args(args)
-        .env("JJ_HUNK_SELECTION", &temp_file)
+        .env("JJ_HUNK_SELECTION", temp_file.path())
         .status()
         .context("Failed to run jj")?;
 
-    fs::remove_file(&temp_file).ok();
+    if !status.success() {
+        anyhow::bail!("jj command failed");
+    }
+    Ok(())
+}
 
+fn run_jj_with_query(args: &[&str], query: &str, rev: Option<&str>) -> Result<()> {
+    evaluate(query, &[]).context("Invalid hunkset query")?;
+    let request = ListRequest {
+        options: ListOptions {
+            rev: rev.map(str::to_owned),
+            query: Some(query.to_owned()),
+            ..ListOptions::default()
+        },
+        summary_entries: read_diff_summary(rev)?,
+    };
+
+    // Materialize and evaluate once before jj starts a mutation command.
+    let preview = run_materialized_list(&request, rev).context("Query prevalidation failed")?;
+    let output: ListOutput =
+        serde_json::from_str(&preview).context("Failed to parse query prevalidation output")?;
+    if output.files.is_some_and(|files| files.is_empty()) {
+        return Ok(());
+    }
+
+    let mut request_file = tempfile::Builder::new()
+        .prefix("jj-hunk-query-request-")
+        .tempfile()
+        .context("Failed to reserve query request file")?;
+    request_file
+        .write_all(&serde_json::to_vec(&request)?)
+        .context("Failed to write query request")?;
+
+    let config_args = jj_hunk_tool_config_args()?;
+    let status = Command::new("jj")
+        .args(&config_args)
+        .args(args)
+        .env(JJ_HUNK_QUERY_REQUEST, request_file.path())
+        .status()
+        .context("Failed to run jj");
+    let status = status?;
     if !status.success() {
         anyhow::bail!("jj command failed");
     }
@@ -1546,6 +1983,47 @@ fn jj_hunk_tool_config_args() -> Result<Vec<String>> {
     Ok(args)
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{create_owned_staging_root, install_prepared_tree};
+    use std::fs;
+
+    #[test]
+    fn failed_install_restores_original_output_tree() {
+        let parent = tempfile::tempdir().unwrap();
+        let right = parent.path().join("right");
+        fs::create_dir(&right).unwrap();
+        fs::write(right.join("original.txt"), "original\n").unwrap();
+
+        let owned = tempfile::Builder::new()
+            .prefix("stage-")
+            .tempdir_in(parent.path())
+            .unwrap();
+        let missing_stage = owned.path().join("missing-stage");
+        let backup = owned.path().join("backup");
+        let error = install_prepared_tree(owned, &missing_stage, &right, &backup).unwrap_err();
+
+        assert!(error.to_string().contains("restored the original output"));
+        assert_eq!(
+            fs::read_to_string(right.join("original.txt")).unwrap(),
+            "original\n"
+        );
+        assert!(!backup.exists());
+    }
+
+    #[test]
+    fn staging_allocation_failure_keeps_existing_path() {
+        let parent = tempfile::tempdir().unwrap();
+        let existing = parent.path().join("existing-file");
+        fs::write(&existing, "keep\n").unwrap();
+
+        let error = create_owned_staging_root(&existing.join("right")).unwrap_err();
+
+        assert!(error.to_string().contains("reserve query staging"));
+        assert_eq!(fs::read_to_string(existing).unwrap(), "keep\n");
+    }
+}
+
 fn jj_config_key_exists(key: &str) -> bool {
     Command::new("jj")
         .args(["config", "get", key])
@@ -1561,6 +2039,7 @@ fn toml_string(value: &str) -> String {
 pub fn split(
     spec: Option<&str>,
     spec_file: Option<&str>,
+    query: Option<&str>,
     message: &str,
     rev: Option<&str>,
 ) -> Result<()> {
@@ -1569,22 +2048,34 @@ pub fn split(
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file)
+    run_jj_with_selection(&args, spec, spec_file, query, rev)
 }
 
-pub fn commit(spec: Option<&str>, spec_file: Option<&str>, message: &str) -> Result<()> {
+pub fn commit(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    query: Option<&str>,
+    message: &str,
+) -> Result<()> {
     run_jj_with_selection(
         &["commit", "-i", JJ_HUNK_TOOL_ARG, "-m", message],
         spec,
         spec_file,
+        query,
+        None,
     )
 }
 
-pub fn squash(spec: Option<&str>, spec_file: Option<&str>, rev: Option<&str>) -> Result<()> {
+pub fn squash(
+    spec: Option<&str>,
+    spec_file: Option<&str>,
+    query: Option<&str>,
+    rev: Option<&str>,
+) -> Result<()> {
     let mut args = vec!["squash", "-i", JJ_HUNK_TOOL_ARG];
     if let Some(rev) = rev {
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file)
+    run_jj_with_selection(&args, spec, spec_file, query, rev)
 }
