@@ -1,4 +1,7 @@
-use hunkset::{evaluate, OccurrenceKey, SelectableUnit};
+use hunkset::{
+    evaluate, evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceKey,
+    SelectableUnit,
+};
 use std::collections::HashSet;
 
 fn fixture() -> Vec<SelectableUnit> {
@@ -215,8 +218,8 @@ fn reports_invalid_syntax_unknown_functions_and_wrong_arguments() {
     assert!(invalid_regex.message().contains("invalid regex"));
     assert_eq!(invalid_regex.offset(), 14);
 
-    let unknown = evaluate("semantic(\"timeout\")", &fixture()).unwrap_err();
-    assert_eq!(unknown.message(), "unknown function `semantic`");
+    let unknown = evaluate("semantic()", &fixture()).unwrap_err();
+    assert_eq!(unknown.message(), "unknown function or alias `semantic`");
 
     let wrong_arguments = evaluate("content()", &fixture()).unwrap_err();
     assert_eq!(
@@ -255,4 +258,148 @@ fn selects_file_unit_kinds_independently() {
         indices("~content(\"timeout\") & (renames() | modes() | binaries())"),
         HashSet::from([5, 6, 7])
     );
+}
+
+#[test]
+fn aliases_expand_structurally_with_named_and_set_parameters() {
+    let aliases = AliasEnvironment::new([
+        AliasDefinition::new("generated", Vec::<String>::new(), "files(\"src/new.rs\")").unwrap(),
+        AliasDefinition::new(
+            "handwritten",
+            ["selection"],
+            "(all() ~ generated()) & selection()",
+        )
+        .unwrap(),
+        AliasDefinition::new(
+            "under_src",
+            ["selection"],
+            "files(\"src/**\") & selection()",
+        )
+        .unwrap(),
+    ])
+    .unwrap();
+
+    let aliased =
+        evaluate_with_aliases("handwritten(content(\"timeout\"))", &fixture(), &aliases).unwrap();
+    let expanded = evaluate(
+        "(all() ~ files(\"src/new.rs\")) & content(\"timeout\")",
+        &fixture(),
+    )
+    .unwrap();
+    assert_eq!(aliased, expanded);
+
+    let precedence = evaluate_with_aliases(
+        "under_src(content(\"timeout\") | modes())",
+        &fixture(),
+        &aliases,
+    )
+    .unwrap()
+    .into_iter()
+    .map(OccurrenceKey::index)
+    .collect::<HashSet<_>>();
+    assert_eq!(precedence, HashSet::from([0, 2, 8]));
+}
+
+#[test]
+fn alias_configuration_and_expansion_errors_are_actionable() {
+    for builtin in [
+        "all",
+        "none",
+        "files",
+        "before_files",
+        "after_files",
+        "content",
+        "added",
+        "removed",
+        "regex",
+        "added_regex",
+        "removed_regex",
+        "renames",
+        "modes",
+        "binaries",
+        "creations",
+        "deletions",
+    ] {
+        let collision =
+            AliasEnvironment::new([
+                AliasDefinition::new(builtin, Vec::<String>::new(), "all()").unwrap()
+            ])
+            .unwrap_err();
+        assert!(collision.message().contains("collides with a builtin"));
+    }
+    let duplicate_parameter =
+        AliasDefinition::new("bad", ["selection", "selection"], "all()").unwrap_err();
+    assert!(duplicate_parameter
+        .message()
+        .contains("duplicate alias parameter"));
+    let builtin_parameter = AliasDefinition::new("bad", ["all"], "all()").unwrap_err();
+    assert!(builtin_parameter
+        .message()
+        .contains("parameter `all` collides with a builtin"));
+
+    let duplicate = AliasEnvironment::new([
+        AliasDefinition::new("same", Vec::<String>::new(), "all()").unwrap(),
+        AliasDefinition::new("same", Vec::<String>::new(), "none()").unwrap(),
+    ])
+    .unwrap_err();
+    assert!(duplicate.message().contains("duplicate alias `same`"));
+
+    let aliases = AliasEnvironment::new([
+        AliasDefinition::new("one", ["selection"], "selection()").unwrap(),
+        AliasDefinition::new("cycle_a", Vec::<String>::new(), "cycle_b()").unwrap(),
+        AliasDefinition::new("cycle_b", Vec::<String>::new(), "cycle_a()").unwrap(),
+    ])
+    .unwrap();
+    let unknown = evaluate_with_aliases("missing()", &fixture(), &aliases).unwrap_err();
+    assert_eq!(unknown.message(), "unknown function or alias `missing`");
+    let arity = evaluate_with_aliases("one()", &fixture(), &aliases).unwrap_err();
+    assert!(arity.message().contains("expects 1 arguments, got 0"));
+    let cycle = evaluate_with_aliases("cycle_a()", &fixture(), &aliases).unwrap_err();
+    assert!(cycle.message().contains("cycle_a -> cycle_b -> cycle_a"));
+
+    let definitions = (0..34)
+        .map(|index| {
+            let expression = if index == 33 {
+                "all()".to_owned()
+            } else {
+                format!("alias_{}()", index + 1)
+            };
+            AliasDefinition::new(format!("alias_{index}"), Vec::<String>::new(), &expression)
+                .unwrap()
+        })
+        .collect::<Vec<_>>();
+    let deep = AliasEnvironment::new(definitions).unwrap();
+    let limit = evaluate_with_aliases("alias_0()", &fixture(), &deep).unwrap_err();
+    assert!(limit.message().contains("expansion limit"));
+
+    let duplicating = AliasEnvironment::new([AliasDefinition::new(
+        "duplicate",
+        ["selection"],
+        "selection() | selection()",
+    )
+    .unwrap()])
+    .unwrap();
+    let compound_fileset = (0..16)
+        .map(|index| format!("\"path-{index}\""))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let mut exponential = format!("files(({compound_fileset}))");
+    for _ in 0..9 {
+        exponential = format!("duplicate({exponential})");
+    }
+    let size_limit = evaluate_with_aliases(&exponential, &fixture(), &duplicating).unwrap_err();
+    assert!(size_limit.message().contains("expanded-node limit"));
+
+    let paths = AliasEnvironment::new([AliasDefinition::new(
+        "paths",
+        Vec::<String>::new(),
+        &format!("files(({compound_fileset}))"),
+    )
+    .unwrap()])
+    .unwrap();
+    let repeated_named_alias = std::iter::repeat_n("paths()", 350)
+        .collect::<Vec<_>>()
+        .join(" | ");
+    let named_limit = evaluate_with_aliases(&repeated_named_alias, &fixture(), &paths).unwrap_err();
+    assert!(named_limit.message().contains("expanded-node limit"));
 }

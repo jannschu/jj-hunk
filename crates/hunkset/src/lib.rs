@@ -2,9 +2,82 @@
 
 mod parser;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 pub use parser::QueryError;
+
+const MAX_ALIAS_EXPANSION_DEPTH: usize = 32;
+const MAX_ALIAS_EXPANDED_NODES: usize = 10_000;
+
+/// One parsed alias definition supplied by the caller.
+#[derive(Clone, Debug)]
+pub struct AliasDefinition {
+    name: String,
+    parameters: Vec<String>,
+    expression: parser::Expression,
+}
+
+impl AliasDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        parameters: impl IntoIterator<Item = impl Into<String>>,
+        expression: &str,
+    ) -> Result<Self, QueryError> {
+        let name = name.into();
+        validate_alias_name(&name)?;
+        let parameters = parameters.into_iter().map(Into::into).collect::<Vec<_>>();
+        let mut seen = HashSet::new();
+        for parameter in &parameters {
+            validate_alias_name(parameter)?;
+            if is_builtin(parameter) {
+                return Err(QueryError::new(
+                    0,
+                    format!("alias parameter `{parameter}` collides with a builtin"),
+                ));
+            }
+            if !seen.insert(parameter.clone()) {
+                return Err(QueryError::new(
+                    0,
+                    format!("duplicate alias parameter `{parameter}`"),
+                ));
+            }
+        }
+        Ok(Self {
+            name,
+            parameters,
+            expression: parser::parse(expression)?,
+        })
+    }
+}
+
+/// An explicit alias environment. The evaluator never reads configuration.
+#[derive(Clone, Debug, Default)]
+pub struct AliasEnvironment {
+    definitions: HashMap<String, AliasDefinition>,
+}
+
+impl AliasEnvironment {
+    pub fn new(definitions: impl IntoIterator<Item = AliasDefinition>) -> Result<Self, QueryError> {
+        let mut aliases = Self::default();
+        for definition in definitions {
+            if is_builtin(&definition.name) {
+                return Err(QueryError::new(
+                    0,
+                    format!("alias name `{}` collides with a builtin", definition.name),
+                ));
+            }
+            let name = definition.name.clone();
+            if aliases
+                .definitions
+                .insert(name.clone(), definition)
+                .is_some()
+            {
+                return Err(QueryError::new(0, format!("duplicate alias `{name}`")));
+            }
+        }
+        Ok(aliases)
+    }
+}
 
 /// A key that identifies one unit only for the duration of an evaluation.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -155,9 +228,231 @@ pub fn evaluate(
     query: &str,
     units: &[SelectableUnit],
 ) -> Result<HashSet<OccurrenceKey>, QueryError> {
+    evaluate_with_aliases(query, units, &AliasEnvironment::default())
+}
+
+pub fn evaluate_with_aliases(
+    query: &str,
+    units: &[SelectableUnit],
+    aliases: &AliasEnvironment,
+) -> Result<HashSet<OccurrenceKey>, QueryError> {
     let expression = parser::parse(query)?;
+    let mut remaining_nodes = MAX_ALIAS_EXPANDED_NODES;
+    let expression = expand_aliases(
+        &expression,
+        aliases,
+        &HashMap::new(),
+        &mut Vec::new(),
+        0,
+        &mut remaining_nodes,
+    )?;
     let universe = (0..units.len()).map(OccurrenceKey).collect::<HashSet<_>>();
     Ok(evaluate_expression(&expression, units, &universe))
+}
+
+fn expand_aliases(
+    expression: &parser::Expression,
+    aliases: &AliasEnvironment,
+    bindings: &HashMap<String, parser::Expression>,
+    stack: &mut Vec<String>,
+    depth: usize,
+    remaining_nodes: &mut usize,
+) -> Result<parser::Expression, QueryError> {
+    use parser::Expression;
+
+    if depth > MAX_ALIAS_EXPANSION_DEPTH {
+        return Err(QueryError::new(0, "alias expansion limit exceeded"));
+    }
+    consume_expansion_nodes(remaining_nodes, 1)?;
+    Ok(match expression {
+        Expression::Call {
+            name,
+            arguments,
+            offset,
+        } => {
+            if arguments.is_empty() {
+                if let Some(bound) = bindings.get(name) {
+                    consume_expansion_nodes(remaining_nodes, expression_nodes(bound))?;
+                    return Ok(bound.clone());
+                }
+            }
+            let definition = aliases.definitions.get(name).ok_or_else(|| {
+                QueryError::new(*offset, format!("unknown function or alias `{name}`"))
+            })?;
+            if definition.parameters.len() != arguments.len() {
+                return Err(QueryError::new(
+                    *offset,
+                    format!(
+                        "alias `{name}` expects {} arguments, got {}",
+                        definition.parameters.len(),
+                        arguments.len()
+                    ),
+                ));
+            }
+            if stack.contains(name) {
+                let mut cycle = stack.clone();
+                cycle.push(name.clone());
+                return Err(QueryError::new(
+                    *offset,
+                    format!("alias cycle: {}", cycle.join(" -> ")),
+                ));
+            }
+            let expanded_arguments = arguments
+                .iter()
+                .map(|argument| {
+                    expand_aliases(
+                        argument,
+                        aliases,
+                        bindings,
+                        stack,
+                        depth + 1,
+                        remaining_nodes,
+                    )
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let definition_bindings = definition
+                .parameters
+                .iter()
+                .cloned()
+                .zip(expanded_arguments)
+                .collect::<HashMap<_, _>>();
+            stack.push(name.clone());
+            let expanded = expand_aliases(
+                &definition.expression,
+                aliases,
+                &definition_bindings,
+                stack,
+                depth + 1,
+                remaining_nodes,
+            );
+            stack.pop();
+            expanded?
+        }
+        Expression::Union(left, right) => Expression::Union(
+            Box::new(expand_aliases(
+                left,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+            Box::new(expand_aliases(
+                right,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+        ),
+        Expression::Intersection(left, right) => Expression::Intersection(
+            Box::new(expand_aliases(
+                left,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+            Box::new(expand_aliases(
+                right,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+        ),
+        Expression::Difference(left, right) => Expression::Difference(
+            Box::new(expand_aliases(
+                left,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+            Box::new(expand_aliases(
+                right,
+                aliases,
+                bindings,
+                stack,
+                depth,
+                remaining_nodes,
+            )?),
+        ),
+        Expression::Complement(inner) => Expression::Complement(Box::new(expand_aliases(
+            inner,
+            aliases,
+            bindings,
+            stack,
+            depth,
+            remaining_nodes,
+        )?)),
+        Expression::Files(fileset)
+        | Expression::BeforeFiles(fileset)
+        | Expression::AfterFiles(fileset) => {
+            consume_expansion_nodes(remaining_nodes, fileset_nodes(fileset))?;
+            expression.clone()
+        }
+        other => other.clone(),
+    })
+}
+
+fn consume_expansion_nodes(remaining: &mut usize, count: usize) -> Result<(), QueryError> {
+    *remaining = remaining
+        .checked_sub(count)
+        .ok_or_else(|| QueryError::new(0, "alias expanded-node limit exceeded"))?;
+    Ok(())
+}
+
+fn expression_nodes(expression: &parser::Expression) -> usize {
+    use parser::Expression;
+    match expression {
+        Expression::Union(left, right)
+        | Expression::Intersection(left, right)
+        | Expression::Difference(left, right) => {
+            1 + expression_nodes(left) + expression_nodes(right)
+        }
+        Expression::Complement(inner) => 1 + expression_nodes(inner),
+        Expression::Call { arguments, .. } => {
+            1 + arguments.iter().map(expression_nodes).sum::<usize>()
+        }
+        Expression::Files(fileset)
+        | Expression::BeforeFiles(fileset)
+        | Expression::AfterFiles(fileset) => 1 + fileset_nodes(fileset),
+        _ => 1,
+    }
+}
+
+fn fileset_nodes(expression: &parser::FilesetExpression) -> usize {
+    use parser::FilesetExpression;
+    match expression {
+        FilesetExpression::Pattern(_) => 1,
+        FilesetExpression::Union(left, right)
+        | FilesetExpression::Intersection(left, right)
+        | FilesetExpression::Difference(left, right) => {
+            1 + fileset_nodes(left) + fileset_nodes(right)
+        }
+        FilesetExpression::Complement(inner) => 1 + fileset_nodes(inner),
+    }
+}
+
+fn validate_alias_name(name: &str) -> Result<(), QueryError> {
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+        || name.chars().next().unwrap().is_ascii_digit()
+    {
+        return Err(QueryError::new(0, format!("invalid alias name `{name}`")));
+    }
+    Ok(())
+}
+
+fn is_builtin(name: &str) -> bool {
+    parser::builtin_argument(name).is_some()
 }
 
 fn evaluate_expression(
@@ -208,6 +503,7 @@ fn evaluate_expression(
         Expression::RemovedRegex(regex) => matching_keys(units, |unit| {
             removed_side(&unit.change).is_some_and(|side| regex.is_match(side))
         }),
+        Expression::Call { .. } => unreachable!("aliases are expanded before evaluation"),
         Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
         Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),
         Expression::Binaries => matching_keys(units, |unit| matches!(unit.change, Change::Binary)),

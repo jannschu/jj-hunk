@@ -2,7 +2,9 @@ use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
-use hunkset::{evaluate, OccurrenceKey, SelectableUnit};
+use hunkset::{
+    evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceKey, SelectableUnit,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -83,6 +85,7 @@ pub struct ListOptions {
     pub spec: Option<String>,
     pub spec_file: Option<String>,
     pub query: Option<String>,
+    pub aliases: Vec<String>,
     pub binary: BinaryMode,
     pub max_bytes: Option<usize>,
     pub max_lines: Option<usize>,
@@ -100,6 +103,7 @@ impl Default for ListOptions {
             spec: None,
             spec_file: None,
             query: None,
+            aliases: Vec::new(),
             binary: BinaryMode::default(),
             max_bytes: None,
             max_lines: None,
@@ -429,13 +433,22 @@ fn prepare_list(
         });
     }
     if let Some(query) = query {
-        filter_files_by_query(&mut files, query, options.max_bytes, options.max_lines)?;
+        filter_files_by_query(
+            &mut files,
+            query,
+            &options.aliases,
+            options.max_bytes,
+            options.max_lines,
+        )?;
     }
     Ok((options, files))
 }
 
 fn validate_query_options(options: &ListOptions) -> Result<()> {
     let Some(query) = options.query.as_deref() else {
+        if !options.aliases.is_empty() {
+            anyhow::bail!("--alias requires --query");
+        }
         return Ok(());
     };
     if options.spec.is_some() || options.spec_file.is_some() {
@@ -447,8 +460,42 @@ fn validate_query_options(options: &ListOptions) -> Result<()> {
     if options.mode != ListMode::Full {
         anyhow::bail!("--query supports full list output only");
     }
-    evaluate(query, &[]).context("Invalid hunkset query")?;
+    let aliases = parse_alias_environment(&options.aliases)?;
+    evaluate_with_aliases(query, &[], &aliases).context("Invalid hunkset query")?;
     Ok(())
+}
+
+fn parse_alias_environment(definitions: &[String]) -> Result<AliasEnvironment> {
+    let aliases = definitions
+        .iter()
+        .map(|definition| parse_alias_definition(definition))
+        .collect::<Result<Vec<_>>>()?;
+    AliasEnvironment::new(aliases).context("Invalid hunkset alias configuration")
+}
+
+fn parse_alias_definition(definition: &str) -> Result<AliasDefinition> {
+    let (signature, expression) = definition
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("Alias must use name(parameters)=expression"))?;
+    let signature = signature.trim();
+    let expression = expression.trim();
+    let (name, parameters) = signature
+        .strip_suffix(')')
+        .and_then(|signature| signature.split_once('('))
+        .ok_or_else(|| anyhow::anyhow!("Alias must use name(parameters)=expression"))?;
+    if expression.is_empty() {
+        anyhow::bail!("Alias `{}` has an empty expression", name.trim());
+    }
+    let parameters = if parameters.trim().is_empty() {
+        Vec::new()
+    } else {
+        parameters
+            .split(',')
+            .map(|parameter| parameter.trim().to_owned())
+            .collect()
+    };
+    AliasDefinition::new(name.trim(), parameters, expression)
+        .with_context(|| format!("Invalid hunkset alias `{}`", name.trim()))
 }
 
 fn validate_query_entry(entry: &DiffSummaryEntry, path: &str) -> Result<()> {
@@ -593,6 +640,7 @@ fn prepare_file_units(
 fn filter_files_by_query(
     files: &mut Vec<FileEntry>,
     query: &str,
+    alias_definitions: &[String],
     max_bytes: Option<usize>,
     max_lines: Option<usize>,
 ) -> Result<()> {
@@ -601,7 +649,8 @@ fn filter_files_by_query(
         .iter()
         .map(|occurrence| occurrence.unit.clone())
         .collect::<Vec<_>>();
-    let selected_indices = evaluate(query, &units)
+    let aliases = parse_alias_environment(alias_definitions)?;
+    let selected_indices = evaluate_with_aliases(query, &units, &aliases)
         .context("Invalid hunkset query")?
         .into_iter()
         .map(OccurrenceKey::index)
@@ -1890,10 +1939,14 @@ fn run_jj_with_selection(
     spec: Option<&str>,
     spec_file: Option<&str>,
     query: Option<&str>,
+    aliases: &[String],
     rev: Option<&str>,
 ) -> Result<()> {
     if let Some(query) = query {
-        return run_jj_with_query(args, query, rev);
+        return run_jj_with_query(args, query, aliases, rev);
+    }
+    if !aliases.is_empty() {
+        anyhow::bail!("--alias requires --query");
     }
     let spec_content = resolve_spec_input(spec, spec_file)?;
     let mut temp_file = tempfile::Builder::new()
@@ -1919,12 +1972,19 @@ fn run_jj_with_selection(
     Ok(())
 }
 
-fn run_jj_with_query(args: &[&str], query: &str, rev: Option<&str>) -> Result<()> {
-    evaluate(query, &[]).context("Invalid hunkset query")?;
+fn run_jj_with_query(
+    args: &[&str],
+    query: &str,
+    aliases: &[String],
+    rev: Option<&str>,
+) -> Result<()> {
+    let alias_environment = parse_alias_environment(aliases)?;
+    evaluate_with_aliases(query, &[], &alias_environment).context("Invalid hunkset query")?;
     let request = ListRequest {
         options: ListOptions {
             rev: rev.map(str::to_owned),
             query: Some(query.to_owned()),
+            aliases: aliases.to_owned(),
             ..ListOptions::default()
         },
         summary_entries: read_diff_summary(rev)?,
@@ -2040,6 +2100,7 @@ pub fn split(
     spec: Option<&str>,
     spec_file: Option<&str>,
     query: Option<&str>,
+    aliases: &[String],
     message: &str,
     rev: Option<&str>,
 ) -> Result<()> {
@@ -2048,13 +2109,14 @@ pub fn split(
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, query, rev)
+    run_jj_with_selection(&args, spec, spec_file, query, aliases, rev)
 }
 
 pub fn commit(
     spec: Option<&str>,
     spec_file: Option<&str>,
     query: Option<&str>,
+    aliases: &[String],
     message: &str,
 ) -> Result<()> {
     run_jj_with_selection(
@@ -2062,6 +2124,7 @@ pub fn commit(
         spec,
         spec_file,
         query,
+        aliases,
         None,
     )
 }
@@ -2070,6 +2133,7 @@ pub fn squash(
     spec: Option<&str>,
     spec_file: Option<&str>,
     query: Option<&str>,
+    aliases: &[String],
     rev: Option<&str>,
 ) -> Result<()> {
     let mut args = vec!["squash", "-i", JJ_HUNK_TOOL_ARG];
@@ -2077,5 +2141,5 @@ pub fn squash(
         args.push("-r");
         args.push(rev);
     }
-    run_jj_with_selection(&args, spec, spec_file, query, rev)
+    run_jj_with_selection(&args, spec, spec_file, query, aliases, rev)
 }

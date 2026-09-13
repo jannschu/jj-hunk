@@ -1,8 +1,8 @@
-# Hunkset language: decisions and implementation starting point
+# Hunkset language: decisions and implementation
 
-Status: discussion record, 2026-09-13. No implementation is included.
-Function names and CLI examples are provisional. The implementation proposal
-below is not an accepted architecture decision yet.
+Status: implementation record, 2026-09-13. All six stages are implemented,
+tested, and accepted after standards and spec reviews. Parked decisions remain
+out of scope until a later feature needs them.
 
 ## Working decisions
 
@@ -33,10 +33,11 @@ below is not an accepted architecture decision yet.
 - Sets contain distinct occurrences, not deduplicated text. Identical edits in
   different files, comparisons, or positions remain distinct. Sets are unordered;
   the caller controls display order.
-- Support named aliases; parameterized aliases are provisionally accepted.
+- Support named aliases and set-expression parameters through an environment
+  explicitly supplied by the caller.
 - Selecting a rename does not select text changes in its file, or the reverse.
 
-Example, using provisional syntax:
+Example:
 
 ```text
 (files("src/**") & renames())
@@ -60,14 +61,13 @@ prerequisites for a first query preview.
 | What is saved: query, fixed scope, moving scope, or selected IDs? | Re-evaluation and exact reference lookup have different behavior. | Saving requests or selections |
 | Do selections follow edits across rewritten comparisons? | Exact identity does not establish correspondence across rewrites. | An explicit tracking feature; not required for basic IDs |
 | Which line-range and ID selectors are useful? | Location selection and exact occurrence selection answer different requests. Pijul suggests separating visible handles from stored content identity. | Manual selection after preview |
-| What are the final function names, regex syntax, side syntax, and alias rules? | Users need a consistent grammar and useful errors. Behavior above does not settle spelling. | Implementing each relevant parser feature |
 | How do semantic selectors and relations compose? | For example, select edits inside a function, or renames of files with matching edits. | After the core language works on real changes |
 
 Pijul references: [recording sections](https://pijul.org/manual/workflows/splitting_and_combining_changes)
 and [content identity](https://pijul.org/manual/theory). These are inspiration,
 not a requirement to adopt its storage model or a claim that it has our proposed DSL.
 
-## Proposed implementation boundary
+## Implemented boundary
 
 Use one Cargo workspace in this repository, retaining the root jj-hunk package
 and adding a local library at crates/hunkset. Do not create a separate repository
@@ -83,7 +83,7 @@ or publish the crate yet.
 - Use evaluation-local occurrence keys internally. Do not equate existing
   content hashes with unique occurrences or promise persistent IDs yet.
 
-## Proposed first slices
+## Delivery slices
 
 1. Add the library and test realistic fixtures through its public interface.
    Implement all/none, file and literal-content predicates, set operators,
@@ -96,16 +96,17 @@ or publish the crate yet.
 3. Add mutation integration after preview and execution can use the same unit
    construction and selection semantics. Test rename-only, text-only in a renamed
    file, their combination, new/deleted files, binary changes, and mode changes.
-4. Add remaining agreed selectors, regex, and aliases in small tested increments.
-   Revisit parked decisions only as their features require them.
+4. Added explicit side selectors and regex in stage 5. Named and parameterized
+   aliases are implemented and accepted in stage 6. Revisit parked
+   decisions only as later features require them.
 
-First user-visible target, not an existing command:
+First user-visible query form:
 
 ```sh
 jj-hunk list -r @ --query 'files("src/**") & content("timeout")'
 ```
 
-## Current code observations
+## Pre-implementation observations (historical)
 
 - src/diff.rs get_hunks already ends a text block at an unchanged line.
 - compute_hunk_id hashes kind, changed text, and nearby context, not paths or

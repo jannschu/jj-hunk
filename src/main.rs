@@ -11,6 +11,9 @@ use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions};
 #[command(name = "jj-hunk")]
 #[command(about = "Programmatic hunk selection for jj")]
 struct Cli {
+    /// Define a hunkset alias as name(parameters)=expression (repeatable)
+    #[arg(long, global = true)]
+    alias: Vec<String>,
     #[command(subcommand)]
     command: Commands,
 }
@@ -125,9 +128,9 @@ struct ListArgs {
 }
 
 fn main() -> Result<()> {
-    let cli = Cli::parse();
+    let Cli { alias, command } = Cli::parse();
 
-    match cli.command {
+    match command {
         Commands::List(args) => {
             let mode = if args.files {
                 ListMode::Files
@@ -147,6 +150,7 @@ fn main() -> Result<()> {
                 spec: args.spec,
                 spec_file: args.spec_file,
                 query: args.query,
+                aliases: alias,
                 binary: args.binary,
                 max_bytes: args.max_bytes,
                 max_lines: args.max_lines,
@@ -169,6 +173,7 @@ fn main() -> Result<()> {
                 spec.as_deref(),
                 spec_file.as_deref(),
                 query.as_deref(),
+                &alias,
                 &message,
                 rev.as_deref(),
             )
@@ -185,6 +190,7 @@ fn main() -> Result<()> {
                 spec.as_deref(),
                 spec_file.as_deref(),
                 query.as_deref(),
+                &alias,
                 &message,
             )
         }
@@ -199,6 +205,7 @@ fn main() -> Result<()> {
                 spec.as_deref(),
                 spec_file.as_deref(),
                 query.as_deref(),
+                &alias,
                 rev.as_deref(),
             )
         }

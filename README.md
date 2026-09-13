@@ -104,6 +104,21 @@ Mutation commands accept `--query` as an alternative to a spec. Query evaluation
 
 Literal and regex matching is case-sensitive by default. Text predicates search changed text only, not unchanged context. A multiline pattern can span consecutive lines within one removed or added side. It cannot cross from removed text to added text. Hunkset expressions compose with `|`, `&`, binary `~`, unary `~`, and parentheses.
 
+### Query aliases
+
+Use repeatable global `--alias 'name(parameters)=expression'` options. Parameters are set expressions and are referenced with `parameter()` in the alias body. For example:
+
+```bash
+jj-hunk \
+  --alias 'generated()=files("generated/**")' \
+  --alias 'handwritten(selection)=(all() ~ generated()) & selection()' \
+  list --query 'handwritten(content("timeout"))'
+```
+
+The same options work with `split`, `commit`, and `squash`. Alias arguments are parsed expressions, so substitution preserves parentheses and operator precedence. Alias definition syntax, names, builtin collisions, duplicate names and parameters, and body syntax are validated when the environment is built. Wrong arity, unknown names, cycles, more than 32 nested expansions, and more than 10,000 expanded expression or fileset nodes are checked when a query references the alias. All checks for the requested query finish before a mutation starts; unused alias bodies are not recursively resolved.
+
+The `hunkset` library does not read CLI or repository configuration. Callers construct aliases explicitly with `AliasDefinition::new`, collect them with `AliasEnvironment::new`, and call `evaluate_with_aliases`. `evaluate` uses an empty alias environment.
+
 ## Spec Format
 
 Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `--spec-file` or stdin for larger ones. You can select hunks by index (`hunks`) or by stable `ids` (sha256) emitted by `jj-hunk list`. IDs are emitted as `hunk-<sha256>`. `hunks` entries may also be id strings.

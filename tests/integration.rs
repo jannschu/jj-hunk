@@ -804,6 +804,81 @@ fn invalid_regex_fails_before_mutation() {
 }
 
 #[test]
+fn alias_preview_and_commit_match_handwritten_expansion() {
+    let repo = TestRepo::new("query-alias-preview-commit");
+    repo.write_file("src/hand.rs", "timeout = 10\n");
+    repo.write_file("generated/code.rs", "timeout = 10\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src/hand.rs", "timeout = 20\n");
+    repo.write_file("generated/code.rs", "timeout = 20\n");
+
+    let generated = "generated()=files(\"generated/**\")";
+    let handwritten = "handwritten(selection)=(all() ~ generated()) & selection()";
+    let query = "handwritten(content(\"timeout\"))";
+    let expanded = "(all() ~ files(\"generated/**\")) & content(\"timeout\")";
+    let aliased_preview = repo.hunk_ok(&[
+        "--alias",
+        generated,
+        "--alias",
+        handwritten,
+        "list",
+        "--query",
+        query,
+    ]);
+    let expanded_preview = repo.hunk_ok(&["list", "--query", expanded]);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&aliased_preview).unwrap(),
+        serde_json::from_str::<serde_json::Value>(&expanded_preview).unwrap()
+    );
+
+    repo.hunk_ok(&[
+        "commit",
+        "--alias",
+        generated,
+        "--alias",
+        handwritten,
+        "--query",
+        query,
+        "handwritten timeout",
+    ]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/hand.rs"]),
+        "timeout = 20\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "generated/code.rs"]),
+        "timeout = 10\n"
+    );
+    assert_eq!(repo.changed_files("@"), vec!["M generated/code.rs"]);
+}
+
+#[test]
+fn invalid_alias_configuration_fails_before_mutation() {
+    let repo = TestRepo::new("query-invalid-alias-mutation");
+    repo.write_file("base.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("base.txt", "new\n");
+
+    let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let diff_before = repo.jj_ok(&["diff", "--git"]);
+    let error = repo.hunk_fail(&[
+        "commit",
+        "--alias",
+        "content()=all()",
+        "--query",
+        "all()",
+        "must fail",
+    ]);
+
+    assert!(error.contains("collides with a builtin"), "{error}");
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+}
+
+#[test]
 fn squash_query_combined_rename_and_text_applies_both() {
     let repo = TestRepo::new("squash-query-combined");
     prepare_edited_rename(&repo);
@@ -1011,7 +1086,7 @@ fn list_query_selects_creation_and_binary_units_and_rejects_conflicting_filters(
 
     let invalid = repo.hunk_fail(&["list", "--query", "unknown()"]);
     assert!(invalid.contains("Invalid hunkset query"));
-    assert!(invalid.contains("unknown function `unknown`"));
+    assert!(invalid.contains("unknown function or alias `unknown`"));
 }
 
 #[cfg(unix)]

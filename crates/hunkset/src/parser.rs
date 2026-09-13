@@ -1,6 +1,26 @@
 use std::error::Error;
 use std::fmt;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BuiltinArgument {
+    None,
+    String,
+    Fileset,
+}
+
+pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
+    match name {
+        "all" | "none" | "renames" | "modes" | "binaries" | "creations" | "deletions" => {
+            Some(BuiltinArgument::None)
+        }
+        "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" => {
+            Some(BuiltinArgument::String)
+        }
+        "files" | "before_files" | "after_files" => Some(BuiltinArgument::Fileset),
+        _ => None,
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Expression {
     All,
@@ -14,6 +34,11 @@ pub(crate) enum Expression {
     Regex(regex::Regex),
     AddedRegex(regex::Regex),
     RemovedRegex(regex::Regex),
+    Call {
+        name: String,
+        arguments: Vec<Expression>,
+        offset: usize,
+    },
     Renames,
     Modes,
     Binaries,
@@ -50,7 +75,7 @@ impl QueryError {
         &self.message
     }
 
-    fn new(offset: usize, message: impl Into<String>) -> Self {
+    pub(crate) fn new(offset: usize, message: impl Into<String>) -> Self {
         Self {
             offset,
             message: message.into(),
@@ -139,7 +164,7 @@ impl Parser<'_> {
         let function_offset = self.offset;
         let name = self.parse_identifier()?;
         self.expect('(')?;
-        if matches!(name.as_str(), "files" | "before_files" | "after_files") {
+        if builtin_argument(&name) == Some(BuiltinArgument::Fileset) {
             let fileset = self.parse_fileset_union()?;
             self.expect(')')?;
             return Ok(match name.as_str() {
@@ -147,6 +172,15 @@ impl Parser<'_> {
                 "before_files" => Expression::BeforeFiles(fileset),
                 "after_files" => Expression::AfterFiles(fileset),
                 _ => unreachable!(),
+            });
+        }
+        if builtin_argument(&name).is_none() {
+            let arguments = self.parse_expression_arguments()?;
+            self.expect(')')?;
+            return Ok(Expression::Call {
+                name,
+                arguments,
+                offset: function_offset,
             });
         }
         let arguments = self.parse_arguments()?;
@@ -191,6 +225,19 @@ impl Parser<'_> {
                 format!("unknown function `{name}`"),
             )),
         }
+    }
+
+    fn parse_expression_arguments(&mut self) -> Result<Vec<Expression>, QueryError> {
+        self.skip_whitespace();
+        if self.current_character() == Some(')') {
+            return Ok(Vec::new());
+        }
+
+        let mut arguments = vec![self.parse_union()?];
+        while self.consume(',') {
+            arguments.push(self.parse_union()?);
+        }
+        Ok(arguments)
     }
 
     fn parse_fileset_union(&mut self) -> Result<FilesetExpression, QueryError> {
