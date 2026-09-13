@@ -176,10 +176,37 @@ fn evaluate_expression(
                 .chain(unit.new_path.iter())
                 .any(|path| evaluate_fileset(fileset, path))
         }),
+        Expression::BeforeFiles(fileset) => matching_keys(units, |unit| {
+            unit.old_path
+                .as_deref()
+                .is_some_and(|path| evaluate_fileset(fileset, path))
+        }),
+        Expression::AfterFiles(fileset) => matching_keys(units, |unit| {
+            unit.new_path
+                .as_deref()
+                .is_some_and(|path| evaluate_fileset(fileset, path))
+        }),
         Expression::Content(literal) => matching_keys(units, |unit| {
             changed_sides(&unit.change)
                 .into_iter()
                 .any(|side| side.contains(literal))
+        }),
+        Expression::Added(literal) => matching_keys(units, |unit| {
+            added_side(&unit.change).is_some_and(|side| side.contains(literal))
+        }),
+        Expression::Removed(literal) => matching_keys(units, |unit| {
+            removed_side(&unit.change).is_some_and(|side| side.contains(literal))
+        }),
+        Expression::Regex(regex) => matching_keys(units, |unit| {
+            changed_sides(&unit.change)
+                .into_iter()
+                .any(|side| regex.is_match(side))
+        }),
+        Expression::AddedRegex(regex) => matching_keys(units, |unit| {
+            added_side(&unit.change).is_some_and(|side| regex.is_match(side))
+        }),
+        Expression::RemovedRegex(regex) => matching_keys(units, |unit| {
+            removed_side(&unit.change).is_some_and(|side| regex.is_match(side))
         }),
         Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
         Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),
@@ -247,6 +274,20 @@ fn changed_sides(change: &Change) -> Vec<&str> {
         Change::Creation { added } => vec![added],
         Change::Deletion { removed } => vec![removed],
         Change::Rename | Change::Mode | Change::Binary => Vec::new(),
+    }
+}
+
+fn added_side(change: &Change) -> Option<&str> {
+    match change {
+        Change::Text { added, .. } | Change::Creation { added } => Some(added),
+        Change::Deletion { .. } | Change::Rename | Change::Mode | Change::Binary => None,
+    }
+}
+
+fn removed_side(change: &Change) -> Option<&str> {
+    match change {
+        Change::Text { removed, .. } | Change::Deletion { removed } => Some(removed),
+        Change::Creation { .. } | Change::Rename | Change::Mode | Change::Binary => None,
     }
 }
 

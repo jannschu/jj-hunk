@@ -87,13 +87,22 @@ List options:
 - `--binary skip|mark|include` — binary handling (default: mark)
 - `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
 - `--spec <json|yaml>` / `--spec-file <path>` — preview using a spec filter
-- `--query <expression>` — select occurrences with `all()`, `none()`, `files()`, `content()`, `creations()`, `deletions()`, `renames()`, `modes()`, `binaries()`, `|`, `&`, binary `~`, unary `~`, and parentheses
+- `--query <expression>` — select occurrences with text, path, file-kind, and set predicates described below
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit a spec template (JSON/YAML only)
 
 `<spec>` may be an inline JSON/YAML string or `-` to read from stdin. Use `--spec-file <path>` to read a JSON/YAML file (omit `<spec>` when using `--spec-file`).
 
 Mutation commands accept `--query` as an alternative to a spec. Query evaluation uses the complete materialized diff. A valid query that selects no occurrences is a no-op for split, commit, and squash; it does not select all changes. Query and spec inputs cannot be combined.
+
+### Query predicates
+
+- `content("text")` searches either changed text side. `added("text")` and `removed("text")` search only that side.
+- `regex("pattern")` searches either changed text side. `added_regex("pattern")` and `removed_regex("pattern")` search only that side. Regex syntax is the Rust `regex` syntax; inline flags such as `(?i)` are explicit. Escape a regex backslash in the query string, for example `regex("timeout\\s*=\\s*\\d+")`.
+- `files(<fileset>)` matches either path. `before_files(<fileset>)` and `after_files(<fileset>)` match only that path. A fileset supports string globs, `|`, `&`, binary `~`, unary `~`, and parentheses.
+- `creations()`, `deletions()`, `renames()`, `modes()`, and `binaries()` select indivisible file changes. `all()` and `none()` select the full or empty occurrence set.
+
+Literal and regex matching is case-sensitive by default. Text predicates search changed text only, not unchanged context. A multiline pattern can span consecutive lines within one removed or added side. It cannot cross from removed text to added text. Hunkset expressions compose with `|`, `&`, binary `~`, unary `~`, and parentheses.
 
 ## Spec Format
 

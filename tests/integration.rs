@@ -759,6 +759,51 @@ fn commit_query_text_only_keeps_old_path() {
 }
 
 #[test]
+fn side_regex_preview_and_commit_select_the_same_text_occurrence() {
+    let repo = TestRepo::new("query-side-regex-preview-commit");
+    prepare_edited_rename(&repo);
+    let query = r#"after_files("archive/**") & added_regex("timeout\\s*=\\s*20")"#;
+
+    let preview = repo.hunk_ok(&["list", "--query", query]);
+    let value: serde_json::Value = serde_json::from_str(&preview).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 1);
+    assert_eq!(files[0]["path"], "archive/client.rs");
+    assert_eq!(files[0]["hunks"].as_array().unwrap().len(), 1);
+    assert!(files[0]["file_units"].is_null());
+
+    repo.hunk_ok(&["commit", "--query", query, "side regex"]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/client.rs"]),
+        "header\ntimeout = 20\nfooter\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "archive/client.rs"])
+        .status
+        .success());
+}
+
+#[test]
+fn invalid_regex_fails_before_mutation() {
+    let repo = TestRepo::new("query-invalid-regex-mutation");
+    repo.write_file("base.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("base.txt", "new\n");
+
+    let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let diff_before = repo.jj_ok(&["diff", "--git"]);
+    let error = repo.hunk_fail(&["commit", "--query", "regex(\"[\")", "must fail"]);
+
+    assert!(error.contains("invalid regex"), "{error}");
+    assert!(error.contains("byte 6"), "{error}");
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision_before
+    );
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), diff_before);
+}
+
+#[test]
 fn squash_query_combined_rename_and_text_applies_both() {
     let repo = TestRepo::new("squash-query-combined");
     prepare_edited_rename(&repo);

@@ -93,6 +93,77 @@ fn literal_content_is_case_sensitive_and_uses_only_changed_sides() {
 }
 
 #[test]
+fn explicit_text_and_path_sides_are_independent() {
+    assert_eq!(indices("added(\"timeout\")"), HashSet::from([0, 2, 8]));
+    assert_eq!(indices("removed(\"timeout\")"), HashSet::from([0, 4, 8]));
+    assert!(indices("before_files(\"archive/**\")").is_empty());
+    assert_eq!(indices("after_files(\"archive/**\")"), HashSet::from([5]));
+    assert_eq!(
+        indices("before_files(\"src/client.rs\")"),
+        HashSet::from([5])
+    );
+    assert!(indices("after_files(\"src/client.rs\")").is_empty());
+}
+
+#[test]
+fn regex_matching_is_explicit_and_stays_within_one_changed_side() {
+    assert_eq!(
+        indices(r#"regex("timeout\\s*=\\s*2\\d")"#),
+        HashSet::from([0, 8])
+    );
+    assert_eq!(
+        indices(r#"added_regex("timeout\\s*=\\s*2\\d")"#),
+        HashSet::from([0, 8])
+    );
+    assert_eq!(
+        indices(r#"removed_regex("timeout\\s*=\\s*1\\d")"#),
+        HashSet::from([0, 8])
+    );
+    assert!(indices(r#"regex("TIMEOUT")"#).is_empty());
+    assert_eq!(
+        indices(r#"regex("(?i)TIMEOUT")"#),
+        HashSet::from([0, 2, 4, 8])
+    );
+    assert!(indices("content(\"timeout.*20\")").is_empty());
+
+    let multiline =
+        [SelectableUnit::text("notes.txt", "notes.txt", "alpha\nbeta", "gamma\ndelta").unwrap()];
+    assert_eq!(
+        evaluate(r#"removed_regex("alpha\nbeta")"#, &multiline)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        evaluate(r#"added_regex("gamma\ndelta")"#, &multiline)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        evaluate("added(\"gamma\\ndelta\")", &multiline)
+            .unwrap()
+            .len(),
+        1
+    );
+    assert!(evaluate("content(\"beta\\ngamma\")", &multiline)
+        .unwrap()
+        .is_empty());
+    assert!(evaluate(r#"regex("(?s)beta.*gamma")"#, &multiline)
+        .unwrap()
+        .is_empty());
+
+    let metacharacters =
+        [SelectableUnit::creation("expression.txt", "literal a+b and (group)").unwrap()];
+    assert_eq!(
+        evaluate(r#"regex("a\\+b")"#, &metacharacters)
+            .unwrap()
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn text_predicates_do_not_match_non_text_units() {
     assert!(indices("content(\"name.rs\")").is_empty());
     assert!(indices("content(\"script.sh\")").is_empty());
@@ -140,8 +211,12 @@ fn reports_invalid_syntax_unknown_functions_and_wrong_arguments() {
     assert!(syntax.message().contains("expected a function"));
     assert!(syntax.offset() > 0);
 
-    let unknown = evaluate("regex(\"timeout\")", &fixture()).unwrap_err();
-    assert_eq!(unknown.message(), "unknown function `regex`");
+    let invalid_regex = evaluate("all() | regex(\"[\")", &fixture()).unwrap_err();
+    assert!(invalid_regex.message().contains("invalid regex"));
+    assert_eq!(invalid_regex.offset(), 14);
+
+    let unknown = evaluate("semantic(\"timeout\")", &fixture()).unwrap_err();
+    assert_eq!(unknown.message(), "unknown function `semantic`");
 
     let wrong_arguments = evaluate("content()", &fixture()).unwrap_err();
     assert_eq!(

@@ -1,12 +1,19 @@
 use std::error::Error;
 use std::fmt;
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug)]
 pub(crate) enum Expression {
     All,
     None,
     Files(FilesetExpression),
+    BeforeFiles(FilesetExpression),
+    AfterFiles(FilesetExpression),
     Content(String),
+    Added(String),
+    Removed(String),
+    Regex(regex::Regex),
+    AddedRegex(regex::Regex),
+    RemovedRegex(regex::Regex),
     Renames,
     Modes,
     Binaries,
@@ -77,6 +84,11 @@ struct Parser<'a> {
     offset: usize,
 }
 
+struct StringArgument {
+    value: String,
+    offset: usize,
+}
+
 impl Parser<'_> {
     fn parse_union(&mut self) -> Result<Expression, QueryError> {
         let mut expression = self.parse_intersection_or_difference()?;
@@ -127,10 +139,15 @@ impl Parser<'_> {
         let function_offset = self.offset;
         let name = self.parse_identifier()?;
         self.expect('(')?;
-        if name == "files" {
+        if matches!(name.as_str(), "files" | "before_files" | "after_files") {
             let fileset = self.parse_fileset_union()?;
             self.expect(')')?;
-            return Ok(Expression::Files(fileset));
+            return Ok(match name.as_str() {
+                "files" => Expression::Files(fileset),
+                "before_files" => Expression::BeforeFiles(fileset),
+                "after_files" => Expression::AfterFiles(fileset),
+                _ => unreachable!(),
+            });
         }
         let arguments = self.parse_arguments()?;
         self.expect(')')?;
@@ -138,7 +155,20 @@ impl Parser<'_> {
         match (name.as_str(), arguments.as_slice()) {
             ("all", []) => Ok(Expression::All),
             ("none", []) => Ok(Expression::None),
-            ("content", [literal]) => Ok(Expression::Content(literal.clone())),
+            ("content", [argument]) => Ok(Expression::Content(argument.value.clone())),
+            ("added", [argument]) => Ok(Expression::Added(argument.value.clone())),
+            ("removed", [argument]) => Ok(Expression::Removed(argument.value.clone())),
+            ("regex" | "added_regex" | "removed_regex", [argument]) => {
+                let regex = regex::Regex::new(&argument.value).map_err(|error| {
+                    QueryError::new(argument.offset, format!("invalid regex: {error}"))
+                })?;
+                Ok(match name.as_str() {
+                    "regex" => Expression::Regex(regex),
+                    "added_regex" => Expression::AddedRegex(regex),
+                    "removed_regex" => Expression::RemovedRegex(regex),
+                    _ => unreachable!(),
+                })
+            }
             ("renames", []) => Ok(Expression::Renames),
             ("modes", []) => Ok(Expression::Modes),
             ("binaries", []) => Ok(Expression::Binaries),
@@ -150,10 +180,12 @@ impl Parser<'_> {
                     format!("{name}() expects no arguments"),
                 ))
             }
-            ("content", _) => Err(QueryError::new(
-                function_offset,
-                format!("{name}() expects one string argument"),
-            )),
+            ("content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex", _) => {
+                Err(QueryError::new(
+                    function_offset,
+                    format!("{name}() expects one string argument"),
+                ))
+            }
             _ => Err(QueryError::new(
                 function_offset,
                 format!("unknown function `{name}`"),
@@ -214,17 +246,26 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_arguments(&mut self) -> Result<Vec<String>, QueryError> {
+    fn parse_arguments(&mut self) -> Result<Vec<StringArgument>, QueryError> {
         self.skip_whitespace();
         if self.current_character() == Some(')') {
             return Ok(Vec::new());
         }
 
-        let mut arguments = vec![self.parse_string()?];
+        let mut arguments = vec![self.parse_string_argument()?];
         while self.consume(',') {
-            arguments.push(self.parse_string()?);
+            arguments.push(self.parse_string_argument()?);
         }
         Ok(arguments)
+    }
+
+    fn parse_string_argument(&mut self) -> Result<StringArgument, QueryError> {
+        self.skip_whitespace();
+        let offset = self.offset;
+        Ok(StringArgument {
+            value: self.parse_string()?,
+            offset,
+        })
     }
 
     fn parse_identifier(&mut self) -> Result<String, QueryError> {
