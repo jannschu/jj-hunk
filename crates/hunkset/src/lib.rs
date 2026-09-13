@@ -181,6 +181,15 @@ fn evaluate_expression(
                 .into_iter()
                 .any(|side| side.contains(literal))
         }),
+        Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
+        Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),
+        Expression::Binaries => matching_keys(units, |unit| matches!(unit.change, Change::Binary)),
+        Expression::Creations => {
+            matching_keys(units, |unit| matches!(unit.change, Change::Creation { .. }))
+        }
+        Expression::Deletions => {
+            matching_keys(units, |unit| matches!(unit.change, Change::Deletion { .. }))
+        }
         Expression::Union(left, right) => {
             let mut selected = evaluate_expression(left, units, universe);
             selected.extend(evaluate_expression(right, units, universe));

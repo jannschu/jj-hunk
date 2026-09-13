@@ -136,10 +136,35 @@ struct FileEntry {
     #[serde(skip_serializing_if = "Option::is_none")]
     rename: Option<RenameInfo>,
     hunks: Vec<Hunk>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    file_units: Vec<FileUnitOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     binary: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     truncated: Option<bool>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct FileUnitOutput {
+    kind: FileUnitKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    old_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    new_path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    added: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "lowercase")]
+enum FileUnitKind {
+    Creation,
+    Deletion,
+    Rename,
+    Mode,
+    Binary,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -288,38 +313,20 @@ fn render_materialized_list(
         let after_bytes = read_materialized_file(after_root, file_paths.after.as_deref())?;
 
         let is_binary = is_binary_data(&before_bytes) || is_binary_data(&after_bytes);
+        let binary_changed = is_binary && before_bytes != after_bytes;
         let mode_changed = entry.source_executable != entry.target_executable;
-        let special_type = entry.source_type != "file" || entry.target_type != "file";
-        if query.is_some()
-            && (entry.status != "modified"
-                || is_binary
-                || mode_changed
-                || special_type
-                || entry.source_conflict
-                || entry.target_conflict)
-        {
-            let unsupported_kind = if is_binary {
-                "binary"
-            } else if entry.source_conflict || entry.target_conflict {
-                "conflict"
-            } else if mode_changed {
-                "mode"
-            } else if special_type && entry.status == "modified" {
-                "special-file"
-            } else {
-                entry.status.as_str()
-            };
-            anyhow::bail!(
-                "query preview does not yet support file-level `{}` changes: {}",
-                unsupported_kind,
-                path
-            );
+        if query.is_some() {
+            validate_query_entry(&entry, &path)?;
         }
-        if is_binary && options.binary == BinaryMode::Skip {
+        if query.is_none() && is_binary && options.binary == BinaryMode::Skip {
             continue;
         }
 
-        let should_diff = !(is_binary && options.binary == BinaryMode::Mark);
+        let should_diff = if query.is_some() {
+            !is_binary
+        } else {
+            !(is_binary && options.binary == BinaryMode::Mark)
+        };
         let (before_text, before_truncated) = if should_diff && query.is_none() {
             truncate_text(
                 &String::from_utf8_lossy(&before_bytes),
@@ -343,7 +350,9 @@ fn render_materialized_list(
             (String::new(), false)
         };
 
-        let mut hunks = if should_diff {
+        let mut hunks = if should_diff
+            && !(query.is_some() && matches!(entry.status.as_str(), "added" | "removed"))
+        {
             get_hunks(&before_text, &after_text)
         } else {
             Vec::new()
@@ -353,14 +362,20 @@ fn render_materialized_list(
             hunks = filter_hunks(hunks, selection);
         }
 
-        if query.is_some() && hunks.is_empty() {
-            anyhow::bail!(
-                "query preview does not yet support file-level changes without text blocks: {}",
-                path
-            );
-        }
+        let file_units = if query.is_some() {
+            prepare_file_units(
+                &entry,
+                &file_paths,
+                &before_text,
+                &after_text,
+                binary_changed,
+                mode_changed,
+            )
+        } else {
+            Vec::new()
+        };
 
-        if hunks.is_empty() && !is_binary {
+        if hunks.is_empty() && !is_binary && file_units.is_empty() {
             continue;
         }
 
@@ -372,6 +387,7 @@ fn render_materialized_list(
             status: entry.status.clone(),
             rename,
             hunks,
+            file_units,
             binary: if is_binary { Some(true) } else { None },
             truncated: if truncated { Some(true) } else { None },
         });
@@ -441,33 +457,114 @@ fn validate_query_options(options: &ListOptions) -> Result<()> {
     Ok(())
 }
 
+fn validate_query_entry(entry: &DiffSummaryEntry, path: &str) -> Result<()> {
+    if entry.source_conflict || entry.target_conflict {
+        anyhow::bail!("query preview does not support conflicted files: {path}");
+    }
+    if entry.status == "copied" {
+        anyhow::bail!("query preview does not support copied files: {path}");
+    }
+
+    let supported_types = match entry.status.as_str() {
+        "added" => entry.target_type == "file",
+        "removed" => entry.source_type == "file",
+        "modified" | "renamed" => entry.source_type == "file" && entry.target_type == "file",
+        _ => false,
+    };
+    if !supported_types {
+        anyhow::bail!("query preview does not support special-file changes: {path}");
+    }
+    Ok(())
+}
+
+fn prepare_file_units(
+    entry: &DiffSummaryEntry,
+    paths: &FilePaths,
+    before_text: &str,
+    after_text: &str,
+    binary_changed: bool,
+    mode_changed: bool,
+) -> Vec<FileUnitOutput> {
+    let mut units = Vec::new();
+    if entry.status == "renamed" {
+        units.push(FileUnitOutput {
+            kind: FileUnitKind::Rename,
+            old_path: paths.before.clone(),
+            new_path: paths.after.clone(),
+            removed: None,
+            added: None,
+        });
+    }
+    if mode_changed && matches!(entry.status.as_str(), "modified" | "renamed") {
+        units.push(FileUnitOutput {
+            kind: FileUnitKind::Mode,
+            old_path: paths.before.clone(),
+            new_path: paths.after.clone(),
+            removed: None,
+            added: None,
+        });
+    }
+    if binary_changed {
+        units.push(FileUnitOutput {
+            kind: FileUnitKind::Binary,
+            old_path: paths.before.clone(),
+            new_path: paths.after.clone(),
+            removed: None,
+            added: None,
+        });
+    } else if entry.status == "added" {
+        units.push(FileUnitOutput {
+            kind: FileUnitKind::Creation,
+            old_path: None,
+            new_path: paths.after.clone(),
+            removed: None,
+            added: Some(after_text.to_owned()),
+        });
+    } else if entry.status == "removed" {
+        units.push(FileUnitOutput {
+            kind: FileUnitKind::Deletion,
+            old_path: paths.before.clone(),
+            new_path: None,
+            removed: Some(before_text.to_owned()),
+            added: None,
+        });
+    }
+    units
+}
+
 fn filter_files_by_query(
     files: &mut Vec<FileEntry>,
     query: &str,
     max_bytes: Option<usize>,
     max_lines: Option<usize>,
 ) -> Result<()> {
-    let units = files
+    let occurrences = prepare_query_occurrences(files);
+    let units = occurrences
         .iter()
-        .flat_map(|file| {
-            file.hunks.iter().map(|hunk| {
-                SelectableUnit::text(&file.path, &file.path, &hunk.removed, &hunk.added)
-                    .expect("materialized diff paths are nonempty")
-            })
-        })
+        .map(|occurrence| occurrence.unit.clone())
         .collect::<Vec<_>>();
     let selected_indices = evaluate(query, &units)
         .context("Invalid hunkset query")?
         .into_iter()
         .map(OccurrenceKey::index)
         .collect::<HashSet<_>>();
+    let selected_locations = occurrences
+        .iter()
+        .enumerate()
+        .filter_map(|(occurrence_index, occurrence)| {
+            selected_indices
+                .contains(&occurrence_index)
+                .then_some((occurrence.file_index, occurrence.location))
+        })
+        .collect::<HashSet<_>>();
 
-    let mut occurrence_index = 0usize;
-    for file in files.iter_mut() {
+    for (file_index, file) in files.iter_mut().enumerate() {
         let mut display_truncated = false;
+        let mut hunk_index = 0usize;
         file.hunks.retain_mut(|hunk| {
-            let keep = selected_indices.contains(&occurrence_index);
-            occurrence_index += 1;
+            let keep =
+                selected_locations.contains(&(file_index, PreparedLocation::Hunk(hunk_index)));
+            hunk_index += 1;
             if keep {
                 let (removed, removed_truncated) =
                     truncate_text(&hunk.removed, max_bytes, max_lines);
@@ -478,12 +575,124 @@ fn filter_files_by_query(
             }
             keep
         });
+        let mut file_unit_index = 0usize;
+        file.file_units.retain_mut(|unit| {
+            let keep = selected_locations
+                .contains(&(file_index, PreparedLocation::FileUnit(file_unit_index)));
+            file_unit_index += 1;
+            if keep {
+                display_truncated |= truncate_file_unit(unit, max_bytes, max_lines);
+            }
+            keep
+        });
+        if !file
+            .file_units
+            .iter()
+            .any(|unit| unit.kind == FileUnitKind::Rename)
+        {
+            file.rename = None;
+        }
+        if !file
+            .file_units
+            .iter()
+            .any(|unit| unit.kind == FileUnitKind::Binary)
+        {
+            file.binary = None;
+        }
         if display_truncated {
             file.truncated = Some(true);
         }
     }
-    files.retain(|file| !file.hunks.is_empty());
+    files.retain(|file| !file.hunks.is_empty() || !file.file_units.is_empty());
     Ok(())
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PreparedLocation {
+    Hunk(usize),
+    FileUnit(usize),
+}
+
+struct PreparedOccurrence {
+    unit: SelectableUnit,
+    file_index: usize,
+    location: PreparedLocation,
+}
+
+fn prepare_query_occurrences(files: &[FileEntry]) -> Vec<PreparedOccurrence> {
+    let mut occurrences = Vec::new();
+    for (file_index, file) in files.iter().enumerate() {
+        for (file_unit_index, output) in file.file_units.iter().enumerate() {
+            occurrences.push(PreparedOccurrence {
+                unit: selectable_file_unit(output),
+                file_index,
+                location: PreparedLocation::FileUnit(file_unit_index),
+            });
+        }
+        for (hunk_index, hunk) in file.hunks.iter().enumerate() {
+            let (old_path, new_path) = file
+                .rename
+                .as_ref()
+                .map(|rename| (rename.from.as_str(), rename.to.as_str()))
+                .unwrap_or((file.path.as_str(), file.path.as_str()));
+            occurrences.push(PreparedOccurrence {
+                unit: SelectableUnit::text(old_path, new_path, &hunk.removed, &hunk.added)
+                    .expect("materialized diff paths are nonempty"),
+                file_index,
+                location: PreparedLocation::Hunk(hunk_index),
+            });
+        }
+    }
+    occurrences
+}
+
+fn selectable_file_unit(output: &FileUnitOutput) -> SelectableUnit {
+    let old_path = output.old_path.as_deref();
+    let new_path = output.new_path.as_deref();
+    match output.kind {
+        FileUnitKind::Creation => SelectableUnit::creation(
+            new_path.expect("creation has a new path"),
+            output.added.as_deref().unwrap_or_default(),
+        ),
+        FileUnitKind::Deletion => SelectableUnit::deletion(
+            old_path.expect("deletion has an old path"),
+            output.removed.as_deref().unwrap_or_default(),
+        ),
+        FileUnitKind::Rename => SelectableUnit::rename(
+            old_path.expect("rename has an old path"),
+            new_path.expect("rename has a new path"),
+        ),
+        FileUnitKind::Mode => SelectableUnit::mode(
+            old_path.expect("mode change has an old path"),
+            new_path.expect("mode change has a new path"),
+        ),
+        FileUnitKind::Binary => match (old_path, new_path) {
+            (Some(old_path), Some(new_path)) => SelectableUnit::binary_existing(old_path, new_path),
+            (None, Some(new_path)) => SelectableUnit::binary_creation(new_path),
+            (Some(old_path), None) => SelectableUnit::binary_deletion(old_path),
+            (None, None) => unreachable!("binary change has at least one path"),
+        },
+    }
+    .expect("prepared query paths are nonempty")
+}
+
+fn truncate_file_unit(
+    unit: &mut FileUnitOutput,
+    max_bytes: Option<usize>,
+    max_lines: Option<usize>,
+) -> bool {
+    let mut truncated = false;
+    if let Some(removed) = &mut unit.removed {
+        let (limited, was_truncated) = truncate_text(removed, max_bytes, max_lines);
+        *removed = limited;
+        truncated |= was_truncated;
+    }
+    if let Some(added) = &mut unit.added {
+        let (limited, was_truncated) = truncate_text(added, max_bytes, max_lines);
+        *added = limited;
+        truncated |= was_truncated;
+    }
+    truncated
 }
 
 const SUMMARY_TEMPLATE: &str = r#""{\"status\":" ++ self.status().escape_json() ++ ",\"path\":" ++ self.path().display().escape_json() ++ ",\"source\":" ++ self.source().path().display().escape_json() ++ ",\"target\":" ++ self.target().path().display().escape_json() ++ ",\"source_type\":" ++ self.source().file_type().escape_json() ++ ",\"target_type\":" ++ self.target().file_type().escape_json() ++ ",\"source_executable\":" ++ self.source().executable() ++ ",\"target_executable\":" ++ self.target().executable() ++ ",\"source_conflict\":" ++ self.source().conflict() ++ ",\"target_conflict\":" ++ self.target().conflict() ++ "}\n""#;
@@ -1062,6 +1271,19 @@ fn render_text_summary_output(output: &ListSummaryOutput) -> String {
 fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
     for file in files {
         lines.push(format_file_header(file));
+        for unit in &file.file_units {
+            lines.push(format!("  {}", file_unit_kind_name(unit.kind)));
+            if let Some(removed) = &unit.removed {
+                for line in removed.lines() {
+                    lines.push(format!("    - {}", line));
+                }
+            }
+            if let Some(added) = &unit.added {
+                for line in added.lines() {
+                    lines.push(format!("    + {}", line));
+                }
+            }
+        }
         for hunk in &file.hunks {
             lines.push(format!(
                 "  hunk {} {} {} (before {}+{} after {}+{})",
@@ -1084,6 +1306,16 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
                 }
             }
         }
+    }
+}
+
+fn file_unit_kind_name(kind: FileUnitKind) -> &'static str {
+    match kind {
+        FileUnitKind::Creation => "creation",
+        FileUnitKind::Deletion => "deletion",
+        FileUnitKind::Rename => "rename",
+        FileUnitKind::Mode => "mode",
+        FileUnitKind::Binary => "binary",
     }
 }
 

@@ -167,3 +167,17 @@ fn rejects_empty_paths_at_the_public_boundary() {
     assert!(SelectableUnit::rename("", "new.rs").is_err());
     assert!(SelectableUnit::binary_deletion("").is_err());
 }
+
+#[test]
+fn selects_file_unit_kinds_independently() {
+    assert_eq!(indices("creations()"), HashSet::from([2, 3]));
+    assert_eq!(indices("deletions()"), HashSet::from([4, 11]));
+    assert_eq!(indices("renames()"), HashSet::from([5]));
+    assert_eq!(indices("modes()"), HashSet::from([6]));
+    assert_eq!(indices("binaries()"), HashSet::from([7]));
+    assert!(indices("content(\"timeout\") & renames()").is_empty());
+    assert_eq!(
+        indices("~content(\"timeout\") & (renames() | modes() | binaries())"),
+        HashSet::from([5, 6, 7])
+    );
+}

@@ -7,6 +7,11 @@ pub(crate) enum Expression {
     None,
     Files(FilesetExpression),
     Content(String),
+    Renames,
+    Modes,
+    Binaries,
+    Creations,
+    Deletions,
     Union(Box<Expression>, Box<Expression>),
     Intersection(Box<Expression>, Box<Expression>),
     Difference(Box<Expression>, Box<Expression>),
@@ -134,10 +139,17 @@ impl Parser<'_> {
             ("all", []) => Ok(Expression::All),
             ("none", []) => Ok(Expression::None),
             ("content", [literal]) => Ok(Expression::Content(literal.clone())),
-            ("all" | "none", _) => Err(QueryError::new(
-                function_offset,
-                format!("{name}() expects no arguments"),
-            )),
+            ("renames", []) => Ok(Expression::Renames),
+            ("modes", []) => Ok(Expression::Modes),
+            ("binaries", []) => Ok(Expression::Binaries),
+            ("creations", []) => Ok(Expression::Creations),
+            ("deletions", []) => Ok(Expression::Deletions),
+            ("all" | "none" | "renames" | "modes" | "binaries" | "creations" | "deletions", _) => {
+                Err(QueryError::new(
+                    function_offset,
+                    format!("{name}() expects no arguments"),
+                ))
+            }
             ("content", _) => Err(QueryError::new(
                 function_offset,
                 format!("{name}() expects one string argument"),

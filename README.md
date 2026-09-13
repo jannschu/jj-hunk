@@ -81,7 +81,7 @@ List options:
 - `--binary skip|mark|include` — binary handling (default: mark)
 - `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
 - `--spec <json|yaml>` / `--spec-file <path>` — preview using a spec filter
-- `--query <expression>` — select whole text blocks with `all()`, `none()`, `files()`, `content()`, `|`, `&`, binary `~`, unary `~`, and parentheses
+- `--query <expression>` — select occurrences with `all()`, `none()`, `files()`, `content()`, `creations()`, `deletions()`, `renames()`, `modes()`, `binaries()`, `|`, `&`, binary `~`, unary `~`, and parentheses
 - `--files` — list files with hunk counts only
 - `--spec-template` — emit a spec template (JSON/YAML only)
 
@@ -111,7 +111,7 @@ Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `-
 
 `ids` and `hunks` are merged if both are provided. Use `jj-hunk list --spec-template` to generate an id-based starting spec.
 
-Query preview currently supports modified text files only. It reports an error for additions, deletions, renames, copies, binary changes, and changes without text blocks. `--query` cannot be combined with `--spec`, `--spec-file`, `--include`, `--exclude`, `--files`, or `--spec-template`. `--max-bytes` and `--max-lines` limit displayed selected text after the query evaluates complete content.
+Query preview returns changed text blocks in `hunks` and selected indivisible changes in `file_units`. Creation and deletion units include their complete added or removed text, including an empty string for empty files. Rename, mode, and binary units are separate from text blocks in the same file. Copies, conflicts, symlinks, trees, and submodules report explicit unsupported-input errors. `--query` cannot be combined with `--spec`, `--spec-file`, `--include`, `--exclude`, `--files`, or `--spec-template`. `--max-bytes` and `--max-lines` limit displayed selected text after the query evaluates complete content.
 
 ## Example Output
 

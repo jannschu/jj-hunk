@@ -635,18 +635,21 @@ fn list_query_evaluates_complete_content_before_display_limits() {
 }
 
 #[test]
-fn list_query_rejects_unsupported_file_units_and_conflicting_filters() {
+fn list_query_selects_creation_and_binary_units_and_rejects_conflicting_filters() {
     let repo = TestRepo::new("list-query-errors");
     repo.write_file("created.rs", "timeout\n");
 
-    let unsupported = repo.hunk_fail(&["list", "--query", "content(\"timeout\")"]);
-    assert!(unsupported.contains("does not yet support file-level `added` changes"));
+    let creation = repo.hunk_ok(&["list", "--query", "content(\"timeout\")"]);
+    let value: serde_json::Value = serde_json::from_str(&creation).unwrap();
+    assert_eq!(value["files"][0]["file_units"][0]["kind"], "creation");
+    assert_eq!(value["files"][0]["file_units"][0]["added"], "timeout\n");
 
     let binary_repo = TestRepo::new("list-query-binary");
     binary_repo.jj_ok(&["commit", "-m", "base"]);
     binary_repo.write_file("binary.dat", "value\0binary");
-    let binary = binary_repo.hunk_fail(&["list", "--query", "all()", "--binary", "skip"]);
-    assert!(binary.contains("file-level `binary` changes"), "{binary}");
+    let binary = binary_repo.hunk_ok(&["list", "--query", "binaries()", "--binary", "skip"]);
+    let value: serde_json::Value = serde_json::from_str(&binary).unwrap();
+    assert_eq!(value["files"][0]["file_units"][0]["kind"], "binary");
 
     let include = repo.hunk_fail(&["list", "--query", "all()", "--include", "src/**"]);
     assert!(include.contains("cannot be used with"));
@@ -661,20 +664,217 @@ fn list_query_rejects_unsupported_file_units_and_conflicting_filters() {
 
 #[cfg(unix)]
 #[test]
-fn list_query_rejects_mode_units_even_when_text_also_changed() {
+fn list_query_keeps_mode_and_text_units_independent() {
     use std::os::unix::fs::PermissionsExt;
 
     let repo = TestRepo::new("list-query-mode");
     repo.write_file("script.sh", "old\n");
+    repo.write_file("pure-mode.sh", "unchanged\n");
     repo.jj_ok(&["commit", "-m", "base"]);
     repo.write_file("script.sh", "new\n");
     let path = repo.path().join("script.sh");
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o755);
     std::fs::set_permissions(path, permissions).unwrap();
+    let pure_mode_path = repo.path().join("pure-mode.sh");
+    let mut permissions = std::fs::metadata(&pure_mode_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(pure_mode_path, permissions).unwrap();
 
-    let error = repo.hunk_fail(&["list", "--query", "content(\"new\")"]);
-    assert!(error.contains("file-level `mode` changes"), "{error}");
+    let text = repo.hunk_ok(&["list", "--query", "content(\"new\")"]);
+    let value: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(value["files"][0]["hunks"].as_array().unwrap().len(), 1);
+    assert!(value["files"][0].get("file_units").is_none());
+
+    let mode = repo.hunk_ok(&["list", "--query", "modes()"]);
+    let value: serde_json::Value = serde_json::from_str(&mode).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{mode}");
+    assert!(files
+        .iter()
+        .all(|file| file["file_units"][0]["kind"] == "mode"));
+    assert!(files
+        .iter()
+        .all(|file| file["hunks"].as_array().unwrap().is_empty()));
+}
+
+#[test]
+fn list_query_selects_text_file_units_and_empty_files() {
+    let repo = TestRepo::new("list-query-file-units");
+    repo.write_file("deleted.txt", "removed content\n");
+    repo.write_file("empty-deleted.txt", "");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("deleted.txt")).unwrap();
+    std::fs::remove_file(repo.path().join("empty-deleted.txt")).unwrap();
+    repo.write_file("created.txt", "added content\n");
+    repo.write_file("empty-created.txt", "");
+
+    let creations = repo.hunk_ok(&["list", "--query", "creations()"]);
+    let value: serde_json::Value = serde_json::from_str(&creations).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{creations}");
+    assert!(files
+        .iter()
+        .all(|file| file["file_units"][0]["kind"] == "creation"));
+    assert!(files
+        .iter()
+        .any(|file| file["file_units"][0]["added"] == ""));
+
+    let deletions = repo.hunk_ok(&["list", "--query", "deletions()"]);
+    let value: serde_json::Value = serde_json::from_str(&deletions).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{deletions}");
+    assert!(files
+        .iter()
+        .all(|file| file["file_units"][0]["kind"] == "deletion"));
+    assert!(files
+        .iter()
+        .any(|file| file["file_units"][0]["removed"] == ""));
+
+    let content = repo.hunk_ok(&["list", "--query", "content(\"added content\")"]);
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 1);
+    assert_eq!(value["files"][0]["file_units"][0]["kind"], "creation");
+}
+
+#[cfg(unix)]
+#[test]
+fn list_query_keeps_executable_create_and_delete_indivisible() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("list-query-executable-create-delete");
+    repo.write_file("deleted.sh", "removed\n");
+    let deleted_path = repo.path().join("deleted.sh");
+    let mut permissions = std::fs::metadata(&deleted_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(&deleted_path, permissions).unwrap();
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(deleted_path).unwrap();
+
+    repo.write_file("created.sh", "added\n");
+    let created_path = repo.path().join("created.sh");
+    let mut permissions = std::fs::metadata(&created_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(created_path, permissions).unwrap();
+
+    let output = repo.hunk_ok(&["list", "--query", "all()"]);
+    let value: serde_json::Value = serde_json::from_str(&output).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{output}");
+    assert!(files
+        .iter()
+        .all(|file| file["file_units"].as_array().unwrap().len() == 1));
+    assert!(files
+        .iter()
+        .any(|file| file["file_units"][0]["kind"] == "creation"));
+    assert!(files
+        .iter()
+        .any(|file| file["file_units"][0]["kind"] == "deletion"));
+}
+
+#[cfg(unix)]
+#[test]
+fn list_query_does_not_invent_binary_units_for_rename_or_mode_only() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let repo = TestRepo::new("list-query-binary-metadata-only");
+    repo.write_file("rename.bin", "same\0bytes");
+    repo.write_file("mode.bin", "same\0bytes");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::rename(
+        repo.path().join("rename.bin"),
+        repo.path().join("renamed.bin"),
+    )
+    .unwrap();
+    let mode_path = repo.path().join("mode.bin");
+    let mut permissions = std::fs::metadata(&mode_path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(mode_path, permissions).unwrap();
+
+    let binaries = repo.hunk_ok(&["list", "--query", "binaries()"]);
+    let value: serde_json::Value = serde_json::from_str(&binaries).unwrap();
+    assert!(value["files"].as_array().unwrap().is_empty(), "{binaries}");
+
+    let renames = repo.hunk_ok(&["list", "--query", "renames()"]);
+    let value: serde_json::Value = serde_json::from_str(&renames).unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 1, "{renames}");
+    assert_eq!(value["files"][0]["file_units"][0]["kind"], "rename");
+
+    let modes = repo.hunk_ok(&["list", "--query", "modes()"]);
+    let value: serde_json::Value = serde_json::from_str(&modes).unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 1, "{modes}");
+    assert_eq!(value["files"][0]["file_units"][0]["kind"], "mode");
+}
+
+#[test]
+fn list_query_keeps_edited_rename_and_text_units_independent() {
+    let repo = TestRepo::new("list-query-rename");
+    repo.write_file("src/client.rs", "header\ntimeout = 10\nfooter\n");
+    repo.write_file("src/pure.rs", "unchanged\n");
+    repo.write_file("tests/client.rs", "header\ntimeout = 10\nfooter\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::create_dir_all(repo.path().join("archive")).unwrap();
+    std::fs::rename(
+        repo.path().join("src/client.rs"),
+        repo.path().join("archive/client.rs"),
+    )
+    .unwrap();
+    std::fs::rename(
+        repo.path().join("src/pure.rs"),
+        repo.path().join("archive/pure.rs"),
+    )
+    .unwrap();
+    repo.write_file("archive/client.rs", "header\ntimeout = 20\nfooter\n");
+    repo.write_file("tests/client.rs", "header\ntimeout = 20\nfooter\n");
+
+    let rename = repo.hunk_ok(&["list", "--query", "renames()"]);
+    let value: serde_json::Value = serde_json::from_str(&rename).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 2, "{rename}");
+    assert!(files
+        .iter()
+        .all(|file| file["file_units"][0]["kind"] == "rename"));
+    assert!(files
+        .iter()
+        .all(|file| file["hunks"].as_array().unwrap().is_empty()));
+
+    let content = repo.hunk_ok(&[
+        "list",
+        "--query",
+        "content(\"timeout\") & files(\"archive/**\")",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(value["files"].as_array().unwrap().len(), 1, "{content}");
+    assert!(value["files"][0].get("file_units").is_none());
+    assert!(value["files"][0].get("rename").is_none());
+    assert_eq!(value["files"][0]["hunks"].as_array().unwrap().len(), 1);
+
+    let combined = repo.hunk_ok(&[
+        "list",
+        "--query",
+        "(files(\"src/**\") & renames()) | ((files(\"src/**\") | files(\"tests/**\")) & content(\"timeout\"))",
+    ]);
+    let value: serde_json::Value = serde_json::from_str(&combined).unwrap();
+    let files = value["files"].as_array().unwrap();
+    assert_eq!(files.len(), 3, "{combined}");
+    let archive = files
+        .iter()
+        .find(|file| file["path"] == "archive/client.rs")
+        .unwrap();
+    assert_eq!(archive["file_units"].as_array().unwrap().len(), 1);
+    assert_eq!(archive["hunks"].as_array().unwrap().len(), 1);
+    let occurrence_count = files
+        .iter()
+        .map(|file| {
+            file["hunks"].as_array().unwrap().len()
+                + file
+                    .get("file_units")
+                    .and_then(serde_json::Value::as_array)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+        })
+        .sum::<usize>();
+    assert_eq!(occurrence_count, 4, "{combined}");
 }
 
 #[cfg(unix)]
@@ -691,7 +891,7 @@ fn list_query_rejects_symlinks_without_regressing_ordinary_list() {
     repo.hunk_ok(&["list"]);
     let error = repo.hunk_fail(&["list", "--query", "all()"]);
     assert!(
-        error.contains("file-level `special-file` changes"),
+        error.contains("does not support special-file changes"),
         "{error}"
     );
 }
