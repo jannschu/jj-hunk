@@ -2,9 +2,86 @@
 
 mod parser;
 
+use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::{HashMap, HashSet};
 
 pub use parser::QueryError;
+
+pub const OCCURRENCE_ID_PREFIX: &str = "hunk-";
+
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[serde(transparent)]
+pub struct OccurrenceId(String);
+
+impl OccurrenceId {
+    pub fn parse(value: &str) -> Result<Self, InvalidOccurrenceId> {
+        let value = value.trim();
+        let hex = value
+            .strip_prefix(OCCURRENCE_ID_PREFIX)
+            .or_else(|| value.strip_prefix("id:"))
+            .or_else(|| value.strip_prefix("sha:"))
+            .or_else(|| value.strip_prefix("sha256:"))
+            .ok_or(InvalidOccurrenceId)?;
+        if hex.len() != 64 || !hex.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err(InvalidOccurrenceId);
+        }
+        Ok(Self(format!(
+            "{OCCURRENCE_ID_PREFIX}{}",
+            hex.to_ascii_lowercase()
+        )))
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    pub fn from_sha256(digest: [u8; 32]) -> Self {
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        let mut value = String::with_capacity(OCCURRENCE_ID_PREFIX.len() + 64);
+        value.push_str(OCCURRENCE_ID_PREFIX);
+        for byte in digest {
+            value.push(HEX[(byte >> 4) as usize] as char);
+            value.push(HEX[(byte & 0x0f) as usize] as char);
+        }
+        Self(value)
+    }
+}
+
+impl<'de> Deserialize<'de> for OccurrenceId {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::parse(&value).map_err(serde::de::Error::custom)
+    }
+}
+
+impl std::fmt::Display for OccurrenceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::ops::Deref for OccurrenceId {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct InvalidOccurrenceId;
+
+impl std::fmt::Display for InvalidOccurrenceId {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .write_str("occurrence id must be hunk- followed by exactly 64 hexadecimal characters")
+    }
+}
+
+impl std::error::Error for InvalidOccurrenceId {}
 
 const MAX_ALIAS_EXPANSION_DEPTH: usize = 32;
 const MAX_ALIAS_EXPANDED_NODES: usize = 10_000;
@@ -102,6 +179,7 @@ enum Change {
 /// One distinct, valid occurrence in the caller's comparison scope.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SelectableUnit {
+    occurrence_id: Option<OccurrenceId>,
     old_path: Option<String>,
     new_path: Option<String>,
     change: Change,
@@ -142,6 +220,7 @@ impl SelectableUnit {
         added: impl Into<String>,
     ) -> Result<Self, InvalidPath> {
         Ok(Self {
+            occurrence_id: None,
             old_path: None,
             new_path: Some(nonempty_path(new_path)?),
             change: Change::Creation {
@@ -156,6 +235,7 @@ impl SelectableUnit {
         removed: impl Into<String>,
     ) -> Result<Self, InvalidPath> {
         Ok(Self {
+            occurrence_id: None,
             old_path: Some(nonempty_path(old_path)?),
             new_path: None,
             change: Change::Deletion {
@@ -187,6 +267,7 @@ impl SelectableUnit {
 
     pub fn binary_creation(new_path: impl Into<String>) -> Result<Self, InvalidPath> {
         Ok(Self {
+            occurrence_id: None,
             old_path: None,
             new_path: Some(nonempty_path(new_path)?),
             change: Change::Binary,
@@ -195,6 +276,7 @@ impl SelectableUnit {
 
     pub fn binary_deletion(old_path: impl Into<String>) -> Result<Self, InvalidPath> {
         Ok(Self {
+            occurrence_id: None,
             old_path: Some(nonempty_path(old_path)?),
             new_path: None,
             change: Change::Binary,
@@ -207,10 +289,16 @@ impl SelectableUnit {
         change: Change,
     ) -> Result<Self, InvalidPath> {
         Ok(Self {
+            occurrence_id: None,
             old_path: Some(nonempty_path(old_path)?),
             new_path: Some(nonempty_path(new_path)?),
             change,
         })
+    }
+
+    pub fn with_occurrence_id(mut self, occurrence_id: OccurrenceId) -> Self {
+        self.occurrence_id = Some(occurrence_id);
+        self
     }
 }
 
@@ -236,6 +324,17 @@ pub fn evaluate_with_aliases(
     units: &[SelectableUnit],
     aliases: &AliasEnvironment,
 ) -> Result<HashSet<OccurrenceKey>, QueryError> {
+    let mut occurrence_ids = HashSet::new();
+    for unit in units {
+        if let Some(id) = &unit.occurrence_id {
+            if !occurrence_ids.insert(id) {
+                return Err(QueryError::new(
+                    0,
+                    format!("duplicate occurrence id `{id}`"),
+                ));
+            }
+        }
+    }
     let expression = parser::parse(query)?;
     let mut remaining_nodes = MAX_ALIAS_EXPANDED_NODES;
     let expression = expand_aliases(
@@ -503,6 +602,7 @@ fn evaluate_expression(
         Expression::RemovedRegex(regex) => matching_keys(units, |unit| {
             removed_side(&unit.change).is_some_and(|side| regex.is_match(side))
         }),
+        Expression::Id(id) => matching_keys(units, |unit| unit.occurrence_id.as_ref() == Some(id)),
         Expression::Call { .. } => unreachable!("aliases are expanded before evaluation"),
         Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
         Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),

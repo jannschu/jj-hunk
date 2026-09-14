@@ -57,7 +57,6 @@ prerequisites for a first query preview.
 |---|---|---|
 | Does the language mandate comparison rules, or accept caller-defined rules? | Rename detection, text alignment, and normalization can change the selectable units. Proposed starting point: caller supplies units. | Supporting a second change producer or reproducible saved requests |
 | What comparison does a merge contribute? | Comparing against either parent or their automatic combination selects different changes. | Generalizing revision scope; keep this outside the evaluator |
-| How are exact block IDs derived and tied to commits? | Current hashes are not comparison-bound occurrence IDs. A composite reference can expose provenance; hashing alone does not make it readable. | Adding public ID queries or saved selections |
 | What is saved: query, fixed scope, moving scope, or selected IDs? | Re-evaluation and exact reference lookup have different behavior. | Saving requests or selections |
 | Do selections follow edits across rewritten comparisons? | Exact identity does not establish correspondence across rewrites. | An explicit tracking feature; not required for basic IDs |
 | Which line-range and ID selectors are useful? | Location selection and exact occurrence selection answer different requests. Pijul suggests separating visible handles from stored content identity. | Manual selection after preview |
@@ -80,8 +79,10 @@ or publish the crate yet.
   results, and execute split/commit/squash operations.
 - Keep parser and evaluator in one crate. Do not build an extension framework
   or add a Git dependency to the evaluator for the first version.
-- Use evaluation-local occurrence keys internally. Do not equate existing
-  content hashes with unique occurrences or promise persistent IDs yet.
+- Use evaluation-local occurrence keys internally. Public occurrence IDs are
+  exact, comparison-bound SHA-256 values over a versioned canonical encoding.
+  They identify text and file units in one complete materialized comparison;
+  they are not persistent identities across rewritten comparisons.
 
 ## Delivery slices
 
@@ -99,6 +100,9 @@ or publish the crate yet.
 4. Added explicit side selectors and regex in stage 5. Named and parameterized
    aliases are implemented and accepted in stage 6. Revisit parked
    decisions only as later features require them.
+5. Added exact `id()` lookup and comparison-bound occurrence IDs for text and
+   file units. The legacy spec format continues to use text IDs and whole-file
+   actions; file-unit IDs are available through query output and `id()`.
 
 First user-visible query form:
 
@@ -109,8 +113,9 @@ jj-hunk list -r @ --query 'files("src/**") & content("timeout")'
 ## Pre-implementation observations (historical)
 
 - src/diff.rs get_hunks already ends a text block at an unchanged line.
-- compute_hunk_id hashes kind, changed text, and nearby context, not paths or
-  comparison identity. Distinct occurrences can have the same hash inputs.
+- The former compute_hunk_id hashed kind, changed text, and nearby context, not
+  paths or comparison identity. The implemented occurrence encoding also uses
+  the complete comparison, paths, bytes, modes, unit kind, and text spans.
 - src/commands.rs render_materialized_list can omit non-binary entries without
   text hunks. Rename metadata is not a separate selectable rename unit.
 - Listing can truncate content before diffing. Query evaluation must not silently

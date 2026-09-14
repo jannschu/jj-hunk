@@ -695,6 +695,290 @@ fn commit_query_selects_creation_and_leaves_other_changes() {
     assert_eq!(repo.changed_files("@"), vec!["A remaining.txt"]);
 }
 
+#[test]
+fn occurrence_id_roundtrips_through_all_query_mutations() {
+    for command in ["commit", "split", "squash"] {
+        let repo = TestRepo::new(&format!("occurrence-id-{command}"));
+        repo.write_file("selected.txt", "old\n");
+        repo.write_file("remaining.txt", "old\n");
+        repo.jj_ok(&["commit", "-m", "base"]);
+        repo.write_file("selected.txt", "new\n");
+        repo.write_file("remaining.txt", "new\n");
+
+        let preview = repo.hunk_ok(&["list", "--query", "files(\"selected.txt\")"]);
+        let value: serde_json::Value = serde_json::from_str(&preview).unwrap();
+        let id = value["files"][0]["hunks"][0]["id"].as_str().unwrap();
+        let query = format!("id(\"{id}\")");
+        if command == "squash" {
+            repo.hunk_ok(&[command, "--query", &query]);
+        } else {
+            repo.hunk_ok(&[command, "--query", &query, "selected by id"]);
+        }
+
+        assert_eq!(
+            repo.jj_ok(&["file", "show", "-r", "@-", "selected.txt"]),
+            "new\n"
+        );
+        assert_eq!(
+            repo.jj_ok(&["file", "show", "-r", "@-", "remaining.txt"]),
+            "old\n"
+        );
+        assert_eq!(
+            repo.jj_ok(&["file", "show", "-r", "@", "remaining.txt"]),
+            "new\n"
+        );
+    }
+}
+
+#[test]
+fn normal_creation_id_matches_query_file_unit_for_all_mutations() {
+    for command in ["commit", "split", "squash"] {
+        let repo = TestRepo::new(&format!("occurrence-id-creation-{command}"));
+        repo.jj_ok(&["commit", "-m", "base"]);
+        repo.write_file("created.txt", "created\n");
+        repo.write_file("remaining.txt", "remaining\n");
+
+        let ordinary: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&["list"])).unwrap();
+        let ordinary_id = ordinary["files"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|file| file["path"] == "created.txt")
+            .unwrap()["hunks"][0]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let query_output: serde_json::Value =
+            serde_json::from_str(&repo.hunk_ok(&["list", "--query", "files(\"created.txt\")"]))
+                .unwrap();
+        assert_eq!(query_output["files"][0]["file_units"][0]["id"], ordinary_id);
+
+        let query = format!("id(\"{ordinary_id}\")");
+        if command == "squash" {
+            repo.hunk_ok(&[command, "--query", &query]);
+        } else {
+            repo.hunk_ok(&[command, "--query", &query, "creation by id"]);
+        }
+        assert_eq!(
+            repo.jj_ok(&["file", "show", "-r", "@-", "created.txt"]),
+            "created\n"
+        );
+        assert!(!repo
+            .jj(&["file", "show", "-r", "@-", "remaining.txt"])
+            .status
+            .success());
+    }
+}
+
+#[test]
+fn listed_text_id_roundtrips_through_the_legacy_spec() {
+    let repo = TestRepo::new("occurrence-id-spec");
+    repo.write_file("selected.txt", "old\n");
+    repo.write_file("remaining.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("selected.txt", "new\n");
+    repo.write_file("remaining.txt", "new\n");
+
+    let output: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&["list"])).unwrap();
+    let selected = output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "selected.txt")
+        .unwrap();
+    let id = selected["hunks"][0]["id"].as_str().unwrap();
+    let spec = format!(r#"{{"files":{{"selected.txt":{{"ids":["{id}"]}}}},"default":"reset"}}"#);
+    repo.hunk_ok(&["commit", &spec, "selected by spec id"]);
+
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "selected.txt"]),
+        "new\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "remaining.txt"]),
+        "old\n"
+    );
+}
+
+#[test]
+fn listed_creation_id_roundtrips_through_the_legacy_spec() {
+    let repo = TestRepo::new("occurrence-id-creation-spec");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("created.txt", "created\n");
+    repo.write_file("remaining.txt", "remaining\n");
+
+    let output: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&["list"])).unwrap();
+    let created = output["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|file| file["path"] == "created.txt")
+        .unwrap();
+    let id = created["hunks"][0]["id"].as_str().unwrap();
+    let spec = format!(r#"{{"files":{{"created.txt":{{"ids":["{id}"]}}}},"default":"reset"}}"#);
+    repo.hunk_ok(&["commit", &spec, "creation by spec id"]);
+
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "created.txt"]),
+        "created\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "remaining.txt"])
+        .status
+        .success());
+}
+
+fn different_valid_id(id: &str) -> String {
+    let mut changed = id.to_owned();
+    let replacement = if changed.ends_with('0') { '1' } else { '0' };
+    changed.pop();
+    changed.push(replacement);
+    changed
+}
+
+#[test]
+fn stale_creation_and_deletion_ids_select_no_file_operation() {
+    let creation = TestRepo::new("occurrence-id-stale-creation");
+    creation.jj_ok(&["commit", "-m", "base"]);
+    creation.write_file("item.txt", "created\n");
+    let output: serde_json::Value = serde_json::from_str(&creation.hunk_ok(&["list"])).unwrap();
+    let stale = different_valid_id(output["files"][0]["hunks"][0]["id"].as_str().unwrap());
+    let spec = format!(r#"{{"files":{{"item.txt":{{"ids":["{stale}"]}}}}}}"#);
+    creation.hunk_ok(&["commit", &spec, "stale creation"]);
+    assert!(!creation
+        .jj(&["file", "show", "-r", "@-", "item.txt"])
+        .status
+        .success());
+
+    let deletion = TestRepo::new("occurrence-id-stale-deletion");
+    deletion.write_file("item.txt", "deleted\n");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(
+            deletion.path().join("item.txt"),
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .unwrap();
+    }
+    deletion.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(deletion.path().join("item.txt")).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&deletion.hunk_ok(&["list"])).unwrap();
+    let stale = different_valid_id(output["files"][0]["hunks"][0]["id"].as_str().unwrap());
+    let spec = format!(r#"{{"files":{{"item.txt":{{"ids":["{stale}"]}}}}}}"#);
+    deletion.hunk_ok(&["commit", &spec, "stale deletion"]);
+    assert_eq!(
+        deletion.jj_ok(&["file", "show", "-r", "@-", "item.txt"]),
+        "deleted\n"
+    );
+    assert!(deletion.changed_files("@-").is_empty());
+}
+
+#[test]
+fn empty_file_unit_ids_are_not_legacy_hunk_selectors() {
+    let creation = TestRepo::new("occurrence-id-empty-creation-spec");
+    creation.jj_ok(&["commit", "-m", "base"]);
+    creation.write_file("empty.txt", "");
+    let output: serde_json::Value =
+        serde_json::from_str(&creation.hunk_ok(&["list", "--query", "files(\"empty.txt\")"]))
+            .unwrap();
+    let id = output["files"][0]["file_units"][0]["id"].as_str().unwrap();
+    let spec = format!(r#"{{"files":{{"empty.txt":{{"ids":["{id}"]}}}}}}"#);
+    creation.hunk_ok(&["commit", &spec, "empty creation ID ignored"]);
+    assert!(!creation
+        .jj(&["file", "show", "-r", "@-", "empty.txt"])
+        .status
+        .success());
+
+    let deletion = TestRepo::new("occurrence-id-empty-deletion-spec");
+    deletion.write_file("empty.txt", "");
+    deletion.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(deletion.path().join("empty.txt")).unwrap();
+    let output: serde_json::Value =
+        serde_json::from_str(&deletion.hunk_ok(&["list", "--query", "files(\"empty.txt\")"]))
+            .unwrap();
+    let id = output["files"][0]["file_units"][0]["id"].as_str().unwrap();
+    let spec = format!(r#"{{"files":{{"empty.txt":{{"ids":["{id}"]}}}}}}"#);
+    deletion.hunk_ok(&["commit", &spec, "empty deletion ID ignored"]);
+    assert_eq!(
+        deletion.jj_ok(&["file", "show", "-r", "@-", "empty.txt"]),
+        ""
+    );
+}
+
+#[test]
+fn listed_deletion_id_keeps_the_deletion_in_a_legacy_spec() {
+    let repo = TestRepo::new("occurrence-id-deletion-spec");
+    repo.write_file("item.txt", "deleted\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    std::fs::remove_file(repo.path().join("item.txt")).unwrap();
+    let output: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&["list"])).unwrap();
+    let id = output["files"][0]["hunks"][0]["id"].as_str().unwrap();
+    let spec = format!(r#"{{"files":{{"item.txt":{{"ids":["{id}"]}}}}}}"#);
+    repo.hunk_ok(&["commit", &spec, "deletion by id"]);
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "item.txt"])
+        .status
+        .success());
+}
+
+#[test]
+fn legacy_hunk_selection_rejects_renames_before_mutation() {
+    let repo = TestRepo::new("occurrence-id-rename-spec-rejected");
+    prepare_edited_rename(&repo);
+    let before = repo.jj_ok(&["diff", "--git"]);
+    let id = format!("hunk-{}", "1".repeat(64));
+    let spec =
+        format!(r#"{{"files":{{"archive/client.rs":{{"ids":["{id}"]}}}},"default":"reset"}}"#);
+    let error = repo.hunk_fail(&["commit", &spec, "must fail"]);
+    assert!(error.contains("does not support renamed files"), "{error}");
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), before);
+}
+
+#[test]
+fn occurrence_ids_are_stable_across_formats_and_display_limits() {
+    let repo = TestRepo::new("occurrence-id-stability");
+    repo.write_file("item.txt", "old first\ncontext\nold last\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("item.txt", "new first\ncontext\nnew last\n");
+
+    let full: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&["list"])).unwrap();
+    let limited: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--max-bytes", "1", "--max-lines", "1"]))
+            .unwrap();
+    assert_eq!(
+        full["files"][0]["hunks"][0]["id"],
+        limited["files"][0]["hunks"][0]["id"]
+    );
+
+    let yaml = repo.hunk_ok(&["list", "--query", "all()", "--format", "yaml"]);
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&yaml).unwrap();
+    assert_eq!(
+        full["files"][0]["hunks"][0]["id"].as_str(),
+        yaml_value["files"][0]["hunks"][0]["id"].as_str()
+    );
+}
+
+#[test]
+fn occurrence_id_changes_when_the_full_comparison_changes() {
+    let repo = TestRepo::new("occurrence-id-comparison");
+    repo.write_file("selected.txt", "old\n");
+    repo.write_file("other.txt", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("selected.txt", "new\n");
+    let first: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "files(\"selected.txt\")"]))
+            .unwrap();
+    repo.write_file("other.txt", "changed\n");
+    let second: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "files(\"selected.txt\")"]))
+            .unwrap();
+    assert_ne!(
+        first["files"][0]["hunks"][0]["id"],
+        second["files"][0]["hunks"][0]["id"]
+    );
+}
+
 fn prepare_edited_rename(repo: &TestRepo) {
     repo.write_file("src/client.rs", "header\ntimeout = 10\nfooter\n");
     repo.jj_ok(&["commit", "-m", "base"]);

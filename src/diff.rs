@@ -1,10 +1,10 @@
+use crate::occurrence::{file_id, text_id, FileIdentity, ID_PREFIX};
+use hunkset::OccurrenceId;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use similar::{ChangeTag, TextDiff};
 use std::collections::HashSet;
-use std::fmt::Write;
 
-pub const HUNK_ID_PREFIX: &str = "hunk-";
+pub const HUNK_ID_PREFIX: &str = ID_PREFIX;
 const CONTEXT_LINES: usize = 3;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -25,7 +25,7 @@ pub struct HunkContext {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Hunk {
     pub index: usize,
-    pub id: String,
+    pub id: OccurrenceId,
     #[serde(rename = "type")]
     pub hunk_type: String,
     pub removed: String,
@@ -41,7 +41,7 @@ pub struct Hunk {
 #[derive(Debug, Clone, Default)]
 pub struct HunkSelection {
     pub indices: HashSet<usize>,
-    pub ids: HashSet<String>,
+    pub ids: HashSet<OccurrenceId>,
 }
 
 impl HunkSelection {
@@ -49,13 +49,13 @@ impl HunkSelection {
         self.indices.is_empty() && self.ids.is_empty()
     }
 
-    pub fn matches(&self, index: usize, id: &str) -> bool {
+    pub fn matches(&self, index: usize, id: &OccurrenceId) -> bool {
         self.indices.contains(&index) || self.ids.contains(id)
     }
 }
 
 /// Extract hunks from before/after content
-pub fn get_hunks(before: &str, after: &str) -> Vec<Hunk> {
+pub fn get_hunks(before: &str, after: &str, identity: &FileIdentity<'_>) -> Vec<Hunk> {
     let diff = TextDiff::from_lines(before, after);
     let before_lines = split_lines_with_endings(before);
     let mut hunks = Vec::new();
@@ -83,6 +83,7 @@ pub fn get_hunks(before: &str, after: &str) -> Vec<Hunk> {
                         hunk_after_start,
                         hunk_before_len,
                         hunk_after_len,
+                        identity,
                     );
                     hunk_before_len = 0;
                     hunk_after_len = 0;
@@ -128,6 +129,7 @@ pub fn get_hunks(before: &str, after: &str) -> Vec<Hunk> {
             hunk_after_start,
             hunk_before_len,
             hunk_after_len,
+            identity,
         );
     }
 
@@ -143,6 +145,7 @@ fn finalize_hunk(
     after_start: usize,
     before_length: usize,
     after_length: usize,
+    identity: &FileIdentity<'_>,
 ) {
     let removed = std::mem::take(current_removed);
     let added = std::mem::take(current_added);
@@ -156,7 +159,16 @@ fn finalize_hunk(
         length: after_length,
     };
     let context = build_context(before_lines, &before_range);
-    let id = compute_hunk_id(hunk_type, &removed, &added, context.as_ref());
+    let id = text_id(
+        identity,
+        hunk_type,
+        before_start,
+        before_length,
+        after_start,
+        after_length,
+        &removed,
+        &added,
+    );
 
     hunks.push(Hunk {
         index: hunks.len(),
@@ -171,20 +183,37 @@ fn finalize_hunk(
 }
 
 /// Apply only selected hunks, returning the result
-pub fn apply_selected_hunks(before: &str, after: &str, selected: &HunkSelection) -> String {
+pub fn apply_selected_hunks(
+    before: &str,
+    after: &str,
+    selected: &HunkSelection,
+    identity: &FileIdentity<'_>,
+) -> String {
+    let mut resolved = selected.clone();
+    let projected_file_id = match (identity.old_path, identity.new_path) {
+        (None, Some(_)) => Some(file_id(identity, "creation")),
+        (Some(_), None) => Some(file_id(identity, "deletion")),
+        _ => None,
+    };
+    if projected_file_id
+        .as_ref()
+        .is_some_and(|id| selected.ids.contains(id))
+    {
+        resolved.indices.insert(0);
+    }
+    for hunk in get_hunks(before, after, identity) {
+        if selected.ids.contains(&hunk.id) {
+            resolved.indices.insert(hunk.index);
+        }
+    }
     let diff = TextDiff::from_lines(before, after);
-    let before_lines = split_lines_with_endings(before);
     let mut result = String::new();
     let mut hunk_idx = 0;
     let mut in_hunk = false;
     let mut hunk_before = String::new();
     let mut hunk_after = String::new();
-    let mut before_line = 1;
-    let mut hunk_before_start = 0;
-    let mut hunk_before_len = 0;
 
     for change in diff.iter_all_changes() {
-        let line_count = count_lines(change.value());
         match change.tag() {
             ChangeTag::Equal => {
                 if in_hunk {
@@ -192,34 +221,23 @@ pub fn apply_selected_hunks(before: &str, after: &str, selected: &HunkSelection)
                         &mut result,
                         &mut hunk_before,
                         &mut hunk_after,
-                        &before_lines,
-                        selected,
+                        &resolved,
                         hunk_idx,
-                        hunk_before_start,
-                        hunk_before_len,
                     );
                     hunk_idx += 1;
-                    hunk_before_len = 0;
                     in_hunk = false;
                 }
                 result.push_str(change.value());
-                before_line += line_count;
             }
             ChangeTag::Delete => {
                 if !in_hunk {
                     in_hunk = true;
-                    hunk_before_start = before_line;
-                    hunk_before_len = 0;
                 }
                 hunk_before.push_str(change.value());
-                hunk_before_len += line_count;
-                before_line += line_count;
             }
             ChangeTag::Insert => {
                 if !in_hunk {
                     in_hunk = true;
-                    hunk_before_start = before_line;
-                    hunk_before_len = 0;
                 }
                 hunk_after.push_str(change.value());
             }
@@ -231,11 +249,8 @@ pub fn apply_selected_hunks(before: &str, after: &str, selected: &HunkSelection)
             &mut result,
             &mut hunk_before,
             &mut hunk_after,
-            &before_lines,
-            selected,
+            &resolved,
             hunk_idx,
-            hunk_before_start,
-            hunk_before_len,
         );
     }
 
@@ -246,23 +261,12 @@ fn apply_hunk_selection(
     result: &mut String,
     hunk_before: &mut String,
     hunk_after: &mut String,
-    before_lines: &[&str],
     selected: &HunkSelection,
     hunk_idx: usize,
-    before_start: usize,
-    before_length: usize,
 ) {
     let removed = std::mem::take(hunk_before);
     let added = std::mem::take(hunk_after);
-    let hunk_type = determine_hunk_type(&removed, &added);
-    let before_range = LineRange {
-        start: before_start,
-        length: before_length,
-    };
-    let context = build_context(before_lines, &before_range);
-    let id = compute_hunk_id(hunk_type, &removed, &added, context.as_ref());
-
-    if selected.matches(hunk_idx, &id) {
+    if selected.indices.contains(&hunk_idx) {
         result.push_str(&added);
     } else {
         result.push_str(&removed);
@@ -277,36 +281,7 @@ fn determine_hunk_type(removed: &str, added: &str) -> &'static str {
     }
 }
 
-fn compute_hunk_id(
-    hunk_type: &str,
-    removed: &str,
-    added: &str,
-    context: Option<&HunkContext>,
-) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"type\0");
-    hasher.update(hunk_type.as_bytes());
-    hasher.update(b"\0removed\0");
-    hasher.update(removed.as_bytes());
-    hasher.update(b"\0added\0");
-    hasher.update(added.as_bytes());
-    match context {
-        Some(ctx) => {
-            hasher.update(b"\0context\0");
-            hasher.update(ctx.before.as_bytes());
-            hasher.update(b"\0");
-            hasher.update(ctx.after.as_bytes());
-        }
-        None => {
-            hasher.update(b"\0context\0");
-        }
-    }
-
-    let digest = hasher.finalize();
-    format!("{HUNK_ID_PREFIX}{}", hex_encode(&digest))
-}
-
-pub fn normalize_hunk_id(value: &str) -> Option<String> {
+pub fn normalize_hunk_id(value: &str) -> Option<OccurrenceId> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return None;
@@ -319,19 +294,7 @@ pub fn normalize_hunk_id(value: &str) -> Option<String> {
         .or_else(|| trimmed.strip_prefix("sha256:"))
         .unwrap_or(trimmed);
 
-    if hex.is_empty() || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
-        return None;
-    }
-
-    Some(format!("{HUNK_ID_PREFIX}{}", hex.to_lowercase()))
-}
-
-fn hex_encode(bytes: &[u8]) -> String {
-    let mut out = String::with_capacity(bytes.len() * 2);
-    for byte in bytes {
-        let _ = write!(&mut out, "{:02x}", byte);
-    }
-    out
+    OccurrenceId::parse(&format!("{HUNK_ID_PREFIX}{hex}")).ok()
 }
 
 fn build_context(before_lines: &[&str], before_range: &LineRange) -> Option<HunkContext> {
@@ -392,14 +355,34 @@ fn count_lines(value: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::occurrence::ComparisonFingerprint;
+
+    fn identity<'a>(
+        comparison: &'a ComparisonFingerprint,
+        path: &'a str,
+        before: &'a str,
+        after: &'a str,
+    ) -> FileIdentity<'a> {
+        FileIdentity {
+            comparison,
+            old_path: Some(path),
+            new_path: Some(path),
+            before: before.as_bytes(),
+            after: after.as_bytes(),
+            before_executable: false,
+            after_executable: false,
+        }
+    }
 
     #[test]
     fn hunk_id_is_sha256_hex_and_stable() {
         let before = "one\nTwo\nthree\n";
         let after = "one\nTWO\nthree\n";
 
-        let hunks_first = get_hunks(before, after);
-        let hunks_second = get_hunks(before, after);
+        let comparison = ComparisonFingerprint::test(1);
+        let identity = identity(&comparison, "file.txt", before, after);
+        let hunks_first = get_hunks(before, after, &identity);
+        let hunks_second = get_hunks(before, after, &identity);
 
         assert_eq!(hunks_first.len(), 1);
         assert_eq!(hunks_second.len(), 1);
@@ -421,8 +404,11 @@ mod tests {
         let after_one = "alpha\nbravo!\n";
         let after_two = "alpha\nbravo?\n";
 
-        let id_one = get_hunks(before, after_one)[0].id.clone();
-        let id_two = get_hunks(before, after_two)[0].id.clone();
+        let comparison = ComparisonFingerprint::test(1);
+        let identity_one = identity(&comparison, "file.txt", before, after_one);
+        let identity_two = identity(&comparison, "file.txt", before, after_two);
+        let id_one = get_hunks(before, after_one, &identity_one)[0].id.clone();
+        let id_two = get_hunks(before, after_two, &identity_two)[0].id.clone();
 
         assert_ne!(id_one, id_two);
     }
@@ -432,14 +418,17 @@ mod tests {
         let before = "a\nb\nc\n";
         let after = "a\nb2\nc\n";
 
-        let hunks = get_hunks(before, after);
+        let comparison = ComparisonFingerprint::test(1);
+        let identity = identity(&comparison, "file.txt", before, after);
+        let hunks = get_hunks(before, after, &identity);
         let mut selection = HunkSelection::default();
         selection.ids.insert(hunks[0].id.clone());
 
-        let selected_result = apply_selected_hunks(before, after, &selection);
+        let selected_result = apply_selected_hunks(before, after, &selection, &identity);
         assert_eq!(selected_result, after);
 
-        let empty_result = apply_selected_hunks(before, after, &HunkSelection::default());
+        let empty_result =
+            apply_selected_hunks(before, after, &HunkSelection::default(), &identity);
         assert_eq!(empty_result, before);
     }
 
@@ -447,7 +436,9 @@ mod tests {
     fn normalize_hunk_id_accepts_prefixes() {
         let before = "foo\nbar\n";
         let after = "foo\nBAR\n";
-        let id = get_hunks(before, after)[0].id.clone();
+        let comparison = ComparisonFingerprint::test(1);
+        let identity = identity(&comparison, "file.txt", before, after);
+        let id = get_hunks(before, after, &identity)[0].id.clone();
         let hex = id.strip_prefix(HUNK_ID_PREFIX).unwrap();
         let expected = format!("{HUNK_ID_PREFIX}{hex}");
 
@@ -464,5 +455,23 @@ mod tests {
             Some(expected.as_str())
         );
         assert_eq!(normalize_hunk_id(hex).as_deref(), Some(expected.as_str()));
+        assert!(normalize_hunk_id(&hex[..63]).is_none());
+    }
+
+    #[test]
+    fn identical_edits_are_distinct_by_position_and_path() {
+        let before = "old\nkeep1\nkeep2\nkeep3\nkeep4\nold\n";
+        let after = "new\nkeep1\nkeep2\nkeep3\nkeep4\nnew\n";
+        let comparison = ComparisonFingerprint::test(1);
+        let first_path = identity(&comparison, "first.txt", before, after);
+        let hunks = get_hunks(before, after, &first_path);
+        assert_eq!(hunks.len(), 2);
+        assert_ne!(hunks[0].id, hunks[1].id);
+
+        let second_path = identity(&comparison, "second.txt", before, after);
+        assert_ne!(hunks[0].id, get_hunks(before, after, &second_path)[0].id);
+        let changed_comparison = ComparisonFingerprint::test(2);
+        let changed = identity(&changed_comparison, "first.txt", before, after);
+        assert_ne!(hunks[0].id, get_hunks(before, after, &changed)[0].id);
     }
 }

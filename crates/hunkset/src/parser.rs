@@ -13,7 +13,7 @@ pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
         "all" | "none" | "renames" | "modes" | "binaries" | "creations" | "deletions" => {
             Some(BuiltinArgument::None)
         }
-        "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" => {
+        "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" | "id" => {
             Some(BuiltinArgument::String)
         }
         "files" | "before_files" | "after_files" => Some(BuiltinArgument::Fileset),
@@ -34,6 +34,7 @@ pub(crate) enum Expression {
     Regex(regex::Regex),
     AddedRegex(regex::Regex),
     RemovedRegex(regex::Regex),
+    Id(crate::OccurrenceId),
     Call {
         name: String,
         arguments: Vec<Expression>,
@@ -192,6 +193,10 @@ impl Parser<'_> {
             ("content", [argument]) => Ok(Expression::Content(argument.value.clone())),
             ("added", [argument]) => Ok(Expression::Added(argument.value.clone())),
             ("removed", [argument]) => Ok(Expression::Removed(argument.value.clone())),
+            ("id", [argument]) => Ok(Expression::Id(
+                crate::OccurrenceId::parse(&argument.value)
+                    .map_err(|error| QueryError::new(argument.offset, error.to_string()))?,
+            )),
             ("regex" | "added_regex" | "removed_regex", [argument]) => {
                 let regex = regex::Regex::new(&argument.value).map_err(|error| {
                     QueryError::new(argument.offset, format!("invalid regex: {error}"))
@@ -214,12 +219,13 @@ impl Parser<'_> {
                     format!("{name}() expects no arguments"),
                 ))
             }
-            ("content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex", _) => {
-                Err(QueryError::new(
-                    function_offset,
-                    format!("{name}() expects one string argument"),
-                ))
-            }
+            (
+                "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" | "id",
+                _,
+            ) => Err(QueryError::new(
+                function_offset,
+                format!("{name}() expects one string argument"),
+            )),
             _ => Err(QueryError::new(
                 function_offset,
                 format!("unknown function `{name}`"),

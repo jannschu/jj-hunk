@@ -85,7 +85,7 @@ List options:
 - `--include <glob>` / `--exclude <glob>` — filter paths (repeatable, supports `**`, `*`, `?`)
 - `--group none|directory|extension|status` — group output
 - `--binary skip|mark|include` — binary handling (default: mark)
-- `--max-bytes <n>` / `--max-lines <n>` — truncate before diffing
+- `--max-bytes <n>` / `--max-lines <n>` — limit displayed changed text after IDs and queries use the complete diff
 - `--spec <json|yaml>` / `--spec-file <path>` — preview using a spec filter
 - `--query <expression>` — select occurrences with text, path, file-kind, and set predicates described below
 - `--files` — list files with hunk counts only
@@ -101,6 +101,7 @@ Mutation commands accept `--query` as an alternative to a spec. Query evaluation
 - `regex("pattern")` searches either changed text side. `added_regex("pattern")` and `removed_regex("pattern")` search only that side. Regex syntax is the Rust `regex` syntax; inline flags such as `(?i)` are explicit. Escape a regex backslash in the query string, for example `regex("timeout\\s*=\\s*\\d+")`.
 - `files(<fileset>)` matches either path. `before_files(<fileset>)` and `after_files(<fileset>)` match only that path. A fileset supports string globs, `|`, `&`, binary `~`, unary `~`, and parentheses.
 - `creations()`, `deletions()`, `renames()`, `modes()`, and `binaries()` select indivisible file changes. `all()` and `none()` select the full or empty occurrence set.
+- `id("hunk-<64 hex characters>")` selects one exact occurrence ID from list output. Prefix matching is not supported.
 
 Literal and regex matching is case-sensitive by default. Text predicates search changed text only, not unchanged context. A multiline pattern can span consecutive lines within one removed or added side. It cannot cross from removed text to added text. Hunkset expressions compose with `|`, `&`, binary `~`, unary `~`, and parentheses.
 
@@ -121,7 +122,7 @@ The `hunkset` library does not read CLI or repository configuration. Callers con
 
 ## Spec Format
 
-Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `--spec-file` or stdin for larger ones. You can select hunks by index (`hunks`) or by stable `ids` (sha256) emitted by `jj-hunk list`. IDs are emitted as `hunk-<sha256>`. `hunks` entries may also be id strings.
+Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `--spec-file` or stdin for larger ones. You can select text hunks by index (`hunks`) or by exact `ids` emitted by `jj-hunk list`. IDs use the form `hunk-<64 lowercase hexadecimal characters>`. They bind an occurrence to the complete materialized before/after comparison, paths, file bytes, executable state, and text location. The same comparison produces the same IDs, independent of display limits. Any comparison change can regenerate all IDs, so do not reuse a saved ID after a revision or working-copy change. Releases before this contract used content/context hashes; regenerate saved specs because there is no legacy-ID fallback. Occurrence IDs currently require a Unix platform so executable state is part of the comparison. `hunks` entries may also be ID strings.
 
 ```json
 {
@@ -143,7 +144,7 @@ Specs can be **JSON or YAML**. Inline JSON is convenient for short specs; use `-
 
 `ids` and `hunks` are merged if both are provided. Use `jj-hunk list --spec-template` to generate an id-based starting spec.
 
-Query preview returns changed text blocks in `hunks` and selected indivisible changes in `file_units`. Creation and deletion units include their complete added or removed text, including an empty string for empty files. Rename, mode, and binary units are separate from text blocks in the same file. Copies, conflicts, symlinks, trees, and submodules report explicit unsupported-input errors. `--query` cannot be combined with `--spec`, `--spec-file`, `--include`, `--exclude`, `--files`, or `--spec-template`. `--max-bytes` and `--max-lines` limit displayed selected text after the query evaluates complete content.
+Query preview returns changed text blocks in `hunks` and selected indivisible changes in `file_units`. Both forms include exact occurrence IDs for `id()` queries. Creation and deletion units include their complete added or removed text, including an empty string for empty files. Rename, mode, and binary units are separate from text blocks in the same file. The legacy spec schema keeps text-hunk IDs and whole-file keep/reset actions. Its single-hunk projection for a nonempty creation or deletion shares the corresponding file-unit ID. Legacy hunk or ID selection rejects renamed files; use a query with `id()` for those occurrences. Rename, mode, binary, and empty-file unit IDs are query-only. Empty-file and other file-only occurrences are available with `list --query 'all()'`. Copies, conflicts, symlinks, trees, and submodules report explicit unsupported-input errors. `--query` cannot be combined with `--spec`, `--spec-file`, `--include`, `--exclude`, `--files`, or `--spec-template`. `--max-bytes` and `--max-lines` limit displayed selected text after the query evaluates complete content.
 
 ## Example Output
 

@@ -3,6 +3,7 @@ use clap::{Args, Parser, Subcommand};
 
 mod commands;
 mod diff;
+mod occurrence;
 mod spec;
 
 use commands::{BinaryMode, ListFormat, ListGrouping, ListMode, ListOptions};

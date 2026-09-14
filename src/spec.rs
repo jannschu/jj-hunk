@@ -1,4 +1,5 @@
 use crate::diff::{normalize_hunk_id, HunkSelection};
+use hunkset::OccurrenceId;
 use serde::de::{self, Deserializer};
 use serde::Deserialize;
 use std::collections::HashMap;
@@ -24,7 +25,7 @@ pub struct HunkSpec {
     #[serde(default, deserialize_with = "deserialize_hunk_selectors")]
     pub hunks: Vec<HunkSelector>,
     #[serde(default, deserialize_with = "deserialize_hunk_ids")]
-    pub ids: Vec<String>,
+    pub ids: Vec<OccurrenceId>,
 }
 
 impl HunkSpec {
@@ -50,7 +51,7 @@ impl HunkSpec {
 #[derive(Debug)]
 pub enum HunkSelector {
     Index(usize),
-    Id(String),
+    Id(OccurrenceId),
 }
 
 #[derive(Debug, Deserialize)]
@@ -90,7 +91,7 @@ where
     Ok(parsed)
 }
 
-fn deserialize_hunk_ids<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+fn deserialize_hunk_ids<'de, D>(deserializer: D) -> Result<Vec<OccurrenceId>, D::Error>
 where
     D: Deserializer<'de>,
 {
@@ -159,8 +160,8 @@ mod tests {
         };
 
         assert!(selection.indices.contains(&0));
-        assert!(selection.ids.contains(&id_inline));
-        assert!(selection.ids.contains(&id_from_ids));
+        assert!(selection.ids.iter().any(|id| id.as_str() == id_inline));
+        assert!(selection.ids.iter().any(|id| id.as_str() == id_from_ids));
     }
 
     #[test]

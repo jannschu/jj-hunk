@@ -1,6 +1,6 @@
 use hunkset::{
-    evaluate, evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceKey,
-    SelectableUnit,
+    evaluate, evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceId,
+    OccurrenceKey, SelectableUnit,
 };
 use std::collections::HashSet;
 
@@ -209,6 +209,36 @@ fn duplicate_looking_occurrences_have_distinct_local_keys() {
 }
 
 #[test]
+fn occurrence_ids_match_exactly_and_duplicates_are_rejected() {
+    let first = OccurrenceId::parse(&format!("hunk-{}", "1".repeat(64))).unwrap();
+    let second = OccurrenceId::parse(&format!("sha256:{}", "2".repeat(64))).unwrap();
+    let units = vec![
+        SelectableUnit::text("a.rs", "a.rs", "old", "new")
+            .unwrap()
+            .with_occurrence_id(first.clone()),
+        SelectableUnit::mode("b.rs", "b.rs")
+            .unwrap()
+            .with_occurrence_id(second),
+    ];
+
+    let selected = evaluate(&format!("id(\"{first}\")"), &units).unwrap();
+    assert_eq!(selected.iter().next().unwrap().index(), 0);
+    assert_eq!(selected.len(), 1);
+    assert!(evaluate(&format!("id(\"hunk-{}\")", "1".repeat(63)), &units).is_err());
+
+    let duplicate = vec![
+        SelectableUnit::creation("a.rs", "a")
+            .unwrap()
+            .with_occurrence_id(first.clone()),
+        SelectableUnit::deletion("b.rs", "b")
+            .unwrap()
+            .with_occurrence_id(first),
+    ];
+    let error = evaluate("all()", &duplicate).unwrap_err();
+    assert!(error.message().contains("duplicate occurrence id"));
+}
+
+#[test]
 fn reports_invalid_syntax_unknown_functions_and_wrong_arguments() {
     let syntax = evaluate("all() |", &fixture()).unwrap_err();
     assert!(syntax.message().contains("expected a function"));
@@ -319,6 +349,7 @@ fn alias_configuration_and_expansion_errors_are_actionable() {
         "binaries",
         "creations",
         "deletions",
+        "id",
     ] {
         let collision =
             AliasEnvironment::new([

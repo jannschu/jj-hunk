@@ -1,9 +1,11 @@
 use crate::diff::{apply_selected_hunks, get_hunks, Hunk, HunkSelection};
+use crate::occurrence::{comparison_fingerprint, file_id, ComparisonFingerprint, FileIdentity};
 use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use hunkset::{
-    evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceKey, SelectableUnit,
+    evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceId, OccurrenceKey,
+    SelectableUnit,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -151,6 +153,7 @@ struct FileEntry {
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 struct FileUnitOutput {
+    id: OccurrenceId,
     kind: FileUnitKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     old_path: Option<String>,
@@ -289,7 +292,9 @@ fn render_materialized_list(
     before_root: &Path,
     after_root: &Path,
 ) -> Result<String> {
-    let (options, files) = prepare_list(request, before_root, after_root)?;
+    let prepared = prepare_list(request, before_root, after_root)?;
+    let options = prepared.options;
+    let files = prepared.files;
 
     match options.mode {
         ListMode::Full => {
@@ -334,11 +339,18 @@ fn render_materialized_list(
     }
 }
 
+struct PreparedList {
+    options: ListOptions,
+    files: Vec<FileEntry>,
+    comparison: ComparisonFingerprint,
+}
+
 fn prepare_list(
     request: ListRequest,
     before_root: &Path,
     after_root: &Path,
-) -> Result<(ListOptions, Vec<FileEntry>)> {
+) -> Result<PreparedList> {
+    let comparison = comparison_fingerprint(before_root, after_root)?;
     let options = request.options;
     let spec = options.spec.as_deref().map(Spec::from_str).transpose()?;
     let include = normalize_patterns(&options.include);
@@ -354,6 +366,11 @@ fn prepare_list(
         let decision = spec_decision(spec.as_ref(), &path);
         if matches!(decision, SpecDecision::Skip) {
             continue;
+        }
+        if entry.status == "renamed" && matches!(decision, SpecDecision::KeepSelection(_)) {
+            anyhow::bail!(
+                "legacy hunk selection does not support renamed files; use --query with id(\"...\")"
+            );
         }
 
         let file_paths = file_paths_for_entry(&entry, &path);
@@ -375,35 +392,44 @@ fn prepare_list(
         } else {
             !(is_binary && options.binary == BinaryMode::Mark)
         };
-        let (before_text, before_truncated) = if should_diff && query.is_none() {
-            truncate_text(
-                &String::from_utf8_lossy(&before_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else if should_diff {
+        let before_text = if should_diff {
             (String::from_utf8_lossy(&before_bytes).into_owned(), false)
         } else {
             (String::new(), false)
-        };
-        let (after_text, after_truncated) = if should_diff && query.is_none() {
-            truncate_text(
-                &String::from_utf8_lossy(&after_bytes),
-                options.max_bytes,
-                options.max_lines,
-            )
-        } else if should_diff {
+        }
+        .0;
+        let after_text = if should_diff {
             (String::from_utf8_lossy(&after_bytes).into_owned(), false)
         } else {
             (String::new(), false)
+        }
+        .0;
+        let identity = FileIdentity {
+            comparison: &comparison,
+            old_path: file_paths.before.as_deref(),
+            new_path: file_paths.after.as_deref(),
+            before: &before_bytes,
+            after: &after_bytes,
+            before_executable: entry.source_executable,
+            after_executable: entry.target_executable,
         };
         let mut hunks = if should_diff
             && !(query.is_some() && matches!(entry.status.as_str(), "added" | "removed"))
         {
-            get_hunks(&before_text, &after_text)
+            get_hunks(&before_text, &after_text, &identity)
         } else {
             Vec::new()
         };
+        if query.is_none() && matches!(entry.status.as_str(), "added" | "removed") {
+            if let [hunk] = hunks.as_mut_slice() {
+                let kind = if entry.status == "added" {
+                    "creation"
+                } else {
+                    "deletion"
+                };
+                hunk.id = file_id(&identity, kind);
+            }
+        }
         if let SpecDecision::KeepSelection(selection) = &decision {
             hunks = filter_hunks(hunks, selection);
         }
@@ -415,6 +441,7 @@ fn prepare_list(
                 &after_text,
                 binary_changed,
                 mode_changed,
+                &identity,
             )
         } else {
             Vec::new()
@@ -422,15 +449,20 @@ fn prepare_list(
         if hunks.is_empty() && !is_binary && file_units.is_empty() {
             continue;
         }
-        files.push(FileEntry {
+        let mut file = FileEntry {
             path,
             status: entry.status.clone(),
             rename: rename_info(&entry),
             hunks,
             file_units,
             binary: is_binary.then_some(true),
-            truncated: (before_truncated || after_truncated).then_some(true),
-        });
+            truncated: None,
+        };
+        if query.is_none() && truncate_hunks(&mut file.hunks, options.max_bytes, options.max_lines)
+        {
+            file.truncated = Some(true);
+        }
+        files.push(file);
     }
     if let Some(query) = query {
         filter_files_by_query(
@@ -441,7 +473,23 @@ fn prepare_list(
             options.max_lines,
         )?;
     }
-    Ok((options, files))
+    Ok(PreparedList {
+        options,
+        files,
+        comparison,
+    })
+}
+
+fn truncate_hunks(hunks: &mut [Hunk], max_bytes: Option<usize>, max_lines: Option<usize>) -> bool {
+    let mut truncated = false;
+    for hunk in hunks {
+        let (removed, removed_truncated) = truncate_text(&hunk.removed, max_bytes, max_lines);
+        let (added, added_truncated) = truncate_text(&hunk.added, max_bytes, max_lines);
+        hunk.removed = removed;
+        hunk.added = added;
+        truncated |= removed_truncated || added_truncated;
+    }
+    truncated
 }
 
 fn validate_query_options(options: &ListOptions) -> Result<()> {
@@ -570,6 +618,17 @@ fn validate_materialized_executable(
     Ok(())
 }
 
+#[cfg(unix)]
+fn path_executable(path: &Path) -> Result<bool> {
+    use std::os::unix::fs::PermissionsExt;
+    Ok(fs::metadata(path)?.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(not(unix))]
+fn path_executable(_path: &Path) -> Result<bool> {
+    anyhow::bail!("occurrence IDs require executable-mode inspection on this platform")
+}
+
 #[cfg(not(unix))]
 fn validate_materialized_executable(
     _path: &str,
@@ -589,10 +648,12 @@ fn prepare_file_units(
     after_text: &str,
     binary_changed: bool,
     mode_changed: bool,
+    identity: &FileIdentity<'_>,
 ) -> Vec<FileUnitOutput> {
     let mut units = Vec::new();
     if entry.status == "renamed" {
         units.push(FileUnitOutput {
+            id: file_id(identity, "rename"),
             kind: FileUnitKind::Rename,
             old_path: paths.before.clone(),
             new_path: paths.after.clone(),
@@ -602,6 +663,7 @@ fn prepare_file_units(
     }
     if mode_changed && matches!(entry.status.as_str(), "modified" | "renamed") {
         units.push(FileUnitOutput {
+            id: file_id(identity, "mode"),
             kind: FileUnitKind::Mode,
             old_path: paths.before.clone(),
             new_path: paths.after.clone(),
@@ -611,6 +673,7 @@ fn prepare_file_units(
     }
     if binary_changed {
         units.push(FileUnitOutput {
+            id: file_id(identity, "binary"),
             kind: FileUnitKind::Binary,
             old_path: paths.before.clone(),
             new_path: paths.after.clone(),
@@ -619,6 +682,7 @@ fn prepare_file_units(
         });
     } else if entry.status == "added" {
         units.push(FileUnitOutput {
+            id: file_id(identity, "creation"),
             kind: FileUnitKind::Creation,
             old_path: None,
             new_path: paths.after.clone(),
@@ -627,6 +691,7 @@ fn prepare_file_units(
         });
     } else if entry.status == "removed" {
         units.push(FileUnitOutput {
+            id: file_id(identity, "deletion"),
             kind: FileUnitKind::Deletion,
             old_path: paths.before.clone(),
             new_path: None,
@@ -744,7 +809,8 @@ fn prepare_query_occurrences(files: &[FileEntry]) -> Vec<PreparedOccurrence> {
                 .unwrap_or((file.path.as_str(), file.path.as_str()));
             occurrences.push(PreparedOccurrence {
                 unit: SelectableUnit::text(old_path, new_path, &hunk.removed, &hunk.added)
-                    .expect("materialized diff paths are nonempty"),
+                    .expect("materialized diff paths are nonempty")
+                    .with_occurrence_id(hunk.id.clone()),
                 file_index,
                 location: PreparedLocation::Hunk(hunk_index),
             });
@@ -781,6 +847,7 @@ fn selectable_file_unit(output: &FileUnitOutput) -> SelectableUnit {
         },
     }
     .expect("prepared query paths are nonempty")
+    .with_occurrence_id(output.id.clone())
 }
 
 fn truncate_file_unit(
@@ -1288,7 +1355,11 @@ fn build_spec_template(files: Vec<FileEntry>) -> SpecTemplateOutput {
             continue;
         }
 
-        let ids = file.hunks.into_iter().map(|hunk| hunk.id).collect();
+        let ids = file
+            .hunks
+            .into_iter()
+            .map(|hunk| hunk.id.to_string())
+            .collect();
         output.insert(file.path, SpecTemplateEntry::Ids { ids });
     }
 
@@ -1376,7 +1447,7 @@ fn format_files_text(lines: &mut Vec<String>, files: &[FileEntry]) {
     for file in files {
         lines.push(format_file_header(file));
         for unit in &file.file_units {
-            lines.push(format!("  {}", file_unit_kind_name(unit.kind)));
+            lines.push(format!("  {} {}", file_unit_kind_name(unit.kind), unit.id));
             if let Some(removed) = &unit.removed {
                 for line in removed.lines() {
                     lines.push(format!("    - {}", line));
@@ -1493,6 +1564,7 @@ pub fn select(left: &str, right: &str) -> Result<()> {
 
     let left_path = Path::new(left);
     let right_path = Path::new(right);
+    let comparison = comparison_fingerprint(left_path, right_path)?;
 
     // Get all files in both directories
     let left_files = list_files(left_path);
@@ -1515,7 +1587,7 @@ pub fn select(left: &str, right: &str) -> Result<()> {
             }
             Some(FileSpec::Selection(selection)) => {
                 let selection = selection.to_selection();
-                apply_hunk_selection(left_path, right_path, &filepath, &selection)?;
+                apply_hunk_selection(left_path, right_path, &filepath, &selection, &comparison)?;
             }
             None => {
                 // Use default
@@ -1530,7 +1602,9 @@ pub fn select(left: &str, right: &str) -> Result<()> {
 }
 
 fn apply_query_selection(request: ListRequest, left_root: &Path, right_root: &Path) -> Result<()> {
-    let (_, selected_files) = prepare_list(request.clone(), left_root, right_root)?;
+    let prepared = prepare_list(request.clone(), left_root, right_root)?;
+    let selected_files = prepared.files;
+    let comparison = prepared.comparison;
 
     let selected_by_path = selected_files
         .into_iter()
@@ -1555,6 +1629,7 @@ fn apply_query_selection(request: ListRequest, left_root: &Path, right_root: &Pa
                 right_root,
                 &stage_root,
                 &mut claimed_paths,
+                &comparison,
             )?;
         }
         Ok(())
@@ -1605,6 +1680,7 @@ fn apply_selected_entry(
     right_root: &Path,
     stage_root: &Path,
     claimed_paths: &mut HashMap<String, String>,
+    comparison: &ComparisonFingerprint,
 ) -> Result<()> {
     let paths = file_paths_for_entry(entry, &selected.path);
     let selected_kind = |kind| selected.file_units.iter().any(|unit| unit.kind == kind);
@@ -1652,6 +1728,7 @@ fn apply_selected_entry(
                     target,
                     destination,
                     &selected.hunks,
+                    comparison,
                 )?;
             } else if rename_selected {
                 copy_path(left_root, stage_root, source, destination)?;
@@ -1680,6 +1757,7 @@ fn apply_selected_entry(
                     path,
                     path,
                     &selected.hunks,
+                    comparison,
                 )?;
             }
             if mode_selected {
@@ -1699,14 +1777,28 @@ fn write_selected_text(
     target: &str,
     destination: &str,
     hunks: &[Hunk],
+    comparison: &ComparisonFingerprint,
 ) -> Result<()> {
-    let before = fs::read_to_string(left_root.join(source))?;
-    let after = fs::read_to_string(right_root.join(target))?;
+    let before_bytes = fs::read(left_root.join(source))?;
+    let after_bytes = fs::read(right_root.join(target))?;
+    let before =
+        String::from_utf8(before_bytes.clone()).context("Selected text source is not UTF-8")?;
+    let after =
+        String::from_utf8(after_bytes.clone()).context("Selected text target is not UTF-8")?;
     let selection = HunkSelection {
         indices: hunks.iter().map(|hunk| hunk.index).collect(),
         ids: HashSet::new(),
     };
-    let content = apply_selected_hunks(&before, &after, &selection);
+    let identity = FileIdentity {
+        comparison,
+        old_path: Some(source),
+        new_path: Some(target),
+        before: &before_bytes,
+        after: &after_bytes,
+        before_executable: path_executable(&left_root.join(source))?,
+        after_executable: path_executable(&right_root.join(target))?,
+    };
+    let content = apply_selected_hunks(&before, &after, &selection, &identity);
     let destination = stage_root.join(destination);
     if let Some(parent) = destination.parent() {
         fs::create_dir_all(parent)?;
@@ -1888,6 +1980,7 @@ fn apply_hunk_selection(
     right: &Path,
     filepath: &str,
     selection: &HunkSelection,
+    comparison: &ComparisonFingerprint,
 ) -> Result<()> {
     let left_file = left.join(filepath);
     let right_file = right.join(filepath);
@@ -1898,14 +1991,47 @@ fn apply_hunk_selection(
         String::new()
     };
 
-    let after = if right_file.exists() {
+    let right_exists = right_file.exists();
+    let after = if right_exists {
         fs::read_to_string(&right_file)?
     } else {
-        return Ok(());
+        String::new()
     };
 
-    let result = apply_selected_hunks(&before, &after, selection);
-
+    let before_bytes = before.as_bytes();
+    let after_bytes = after.as_bytes();
+    let identity = FileIdentity {
+        comparison,
+        old_path: left_file.exists().then_some(filepath),
+        new_path: right_exists.then_some(filepath),
+        before: before_bytes,
+        after: after_bytes,
+        before_executable: left_file.exists() && path_executable(&left_file)?,
+        after_executable: right_exists && path_executable(&right_file)?,
+    };
+    if !left_file.exists() {
+        let id = file_id(&identity, "creation");
+        if after.is_empty() || !selection.matches(0, &id) {
+            fs::remove_file(&right_file)?;
+        }
+        return Ok(());
+    }
+    if !right_exists {
+        let id = file_id(&identity, "deletion");
+        if !before.is_empty() && selection.matches(0, &id) {
+            return Ok(());
+        }
+        if let Some(parent) = right_file.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&left_file, &right_file)?;
+        fs::set_permissions(&right_file, fs::metadata(&left_file)?.permissions())?;
+        return Ok(());
+    }
+    let result = apply_selected_hunks(&before, &after, selection, &identity);
+    if let Some(parent) = right_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
     fs::write(&right_file, result)?;
     Ok(())
 }
@@ -1949,6 +2075,20 @@ fn run_jj_with_selection(
         anyhow::bail!("--alias requires --query");
     }
     let spec_content = resolve_spec_input(spec, spec_file)?;
+    let parsed_spec = Spec::from_str(&spec_content)?;
+    for entry in read_diff_summary(rev)? {
+        let path = primary_path(&entry);
+        if entry.status == "renamed"
+            && matches!(
+                spec_decision(Some(&parsed_spec), &path),
+                SpecDecision::KeepSelection(_)
+            )
+        {
+            anyhow::bail!(
+                "legacy hunk selection does not support renamed files; use --query with id(\"...\")"
+            );
+        }
+    }
     let mut temp_file = tempfile::Builder::new()
         .prefix("jj-hunk-spec-")
         .tempfile()
