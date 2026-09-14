@@ -4,8 +4,8 @@ use crate::spec::{Action, DefaultAction, FileSpec, Spec};
 use anyhow::{Context, Result};
 use clap::ValueEnum;
 use hunkset::{
-    evaluate_with_aliases, AliasDefinition, AliasEnvironment, OccurrenceId, OccurrenceKey,
-    SelectableUnit,
+    evaluate_with_aliases, AliasDefinition, AliasEnvironment, AliasSignature, OccurrenceId,
+    OccurrenceKey, SelectableUnit,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -22,6 +22,8 @@ const JJ_HUNK_LIST_REQUEST: &str = "JJ_HUNK_LIST_REQUEST";
 const JJ_HUNK_LIST_OUTPUT: &str = "JJ_HUNK_LIST_OUTPUT";
 const JJ_HUNK_LIST_TOOL: &str = "jj-hunk-list";
 const JJ_HUNK_QUERY_REQUEST: &str = "JJ_HUNK_QUERY_REQUEST";
+const JJ_HUNKSET_ALIASES_KEY: &str = "hunkset-aliases";
+const JJ_HUNKSET_ALIAS_TEMPLATE: &str = r#"name.remove_prefix("hunkset-aliases.").escape_json() ++ "\t" ++ value.as_string().escape_json() ++ "\n""#;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 pub enum ListFormat {
@@ -255,7 +257,7 @@ where
     T: Into<ListOptions>,
 {
     let mut options = options.into();
-    validate_query_options(&options)?;
+    validate_query_options(&mut options)?;
     options.spec = resolve_optional_spec(options.spec.as_deref(), options.spec_file.as_deref())?;
     options.spec_file = None;
 
@@ -492,7 +494,7 @@ fn truncate_hunks(hunks: &mut [Hunk], max_bytes: Option<usize>, max_lines: Optio
     truncated
 }
 
-fn validate_query_options(options: &ListOptions) -> Result<()> {
+fn validate_query_options(options: &mut ListOptions) -> Result<()> {
     let Some(query) = options.query.as_deref() else {
         if !options.aliases.is_empty() {
             anyhow::bail!("--alias requires --query");
@@ -508,32 +510,120 @@ fn validate_query_options(options: &ListOptions) -> Result<()> {
     if options.mode != ListMode::Full {
         anyhow::bail!("--query supports full list output only");
     }
-    let aliases = parse_alias_environment(&options.aliases)?;
-    evaluate_with_aliases(query, &[], &aliases).context("Invalid hunkset query")?;
+    let aliases = resolve_alias_definitions(&options.aliases)?;
+    evaluate_with_aliases(query, &[], &aliases.environment).context("Invalid hunkset query")?;
+    options.aliases = aliases.source_definitions;
     Ok(())
 }
 
-fn parse_alias_environment(definitions: &[String]) -> Result<AliasEnvironment> {
-    let aliases = definitions
-        .iter()
-        .map(|definition| parse_alias_definition(definition))
-        .collect::<Result<Vec<_>>>()?;
-    AliasEnvironment::new(aliases).context("Invalid hunkset alias configuration")
+struct AliasSourceDefinition {
+    source_definition: String,
+    signature: AliasSignature,
+    expression: String,
 }
 
-fn parse_alias_definition(definition: &str) -> Result<AliasDefinition> {
+struct ResolvedAliases {
+    source_definitions: Vec<String>,
+    environment: AliasEnvironment,
+}
+
+fn resolve_alias_definitions(command_line_definitions: &[String]) -> Result<ResolvedAliases> {
+    let configured_definitions = read_config_alias_definitions()?;
+    let configured_definitions = parse_alias_source_definitions(&configured_definitions)
+        .context("Invalid hunkset alias signatures from jj config")?;
+    let command_line_definitions = parse_alias_source_definitions(command_line_definitions)
+        .context("Invalid hunkset alias signatures from --alias")?;
+
+    let command_line_names = command_line_definitions
+        .iter()
+        .map(|definition| definition.signature.name().to_owned())
+        .collect::<HashSet<_>>();
+    let effective_definitions = configured_definitions
+        .into_iter()
+        .filter(|definition| !command_line_names.contains(definition.signature.name()))
+        .chain(command_line_definitions)
+        .collect::<Vec<_>>();
+    let source_definitions = effective_definitions
+        .iter()
+        .map(|definition| definition.source_definition.clone())
+        .collect();
+    let environment = build_alias_environment(effective_definitions)?;
+    Ok(ResolvedAliases {
+        source_definitions,
+        environment,
+    })
+}
+
+fn read_config_alias_definitions() -> Result<Vec<String>> {
+    let output = Command::new("jj")
+        .args([
+            "--ignore-working-copy",
+            "config",
+            "list",
+            JJ_HUNKSET_ALIASES_KEY,
+            "-T",
+            JJ_HUNKSET_ALIAS_TEMPLATE,
+        ])
+        .output()
+        .context("Failed to run jj config list for hunkset aliases")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to read hunkset aliases from jj config: {}",
+            stderr.trim()
+        );
+    }
+
+    let output =
+        String::from_utf8(output.stdout).context("jj config returned non-UTF-8 hunkset aliases")?;
+    output.lines().map(parse_config_alias_definition).collect()
+}
+
+fn parse_config_alias_definition(line: &str) -> Result<String> {
+    let (signature, expression) = line
+        .split_once('\t')
+        .ok_or_else(|| anyhow::anyhow!("Invalid hunkset alias output from jj config"))?;
+    let signature: String = serde_json::from_str(signature)
+        .context("Failed to parse hunkset alias key from jj config")?;
+    let signature = if signature.starts_with('"') {
+        serde_json::from_str(&signature)
+            .context("Failed to parse quoted hunkset alias key from jj config")?
+    } else {
+        signature
+    };
+    let expression: String = serde_json::from_str(expression)
+        .context("Failed to parse hunkset alias expression from jj config")?;
+    Ok(format!("{signature}={expression}"))
+}
+
+fn parse_alias_environment(definitions: &[String]) -> Result<AliasEnvironment> {
+    build_alias_environment(parse_alias_source_definitions(definitions)?)
+}
+
+fn parse_alias_source_definitions(definitions: &[String]) -> Result<Vec<AliasSourceDefinition>> {
+    let definitions = definitions
+        .iter()
+        .map(|definition| parse_alias_source_definition(definition))
+        .collect::<Result<Vec<_>>>()?;
+    let mut names = HashSet::new();
+    for definition in &definitions {
+        let name = definition.signature.name();
+        if !names.insert(name) {
+            anyhow::bail!("duplicate alias `{name}`");
+        }
+    }
+    Ok(definitions)
+}
+
+fn parse_alias_source_definition(definition: &str) -> Result<AliasSourceDefinition> {
     let (signature, expression) = definition
         .split_once('=')
         .ok_or_else(|| anyhow::anyhow!("Alias must use name(parameters)=expression"))?;
-    let signature = signature.trim();
-    let expression = expression.trim();
     let (name, parameters) = signature
+        .trim()
         .strip_suffix(')')
         .and_then(|signature| signature.split_once('('))
         .ok_or_else(|| anyhow::anyhow!("Alias must use name(parameters)=expression"))?;
-    if expression.is_empty() {
-        anyhow::bail!("Alias `{}` has an empty expression", name.trim());
-    }
     let parameters = if parameters.trim().is_empty() {
         Vec::new()
     } else {
@@ -542,8 +632,31 @@ fn parse_alias_definition(definition: &str) -> Result<AliasDefinition> {
             .map(|parameter| parameter.trim().to_owned())
             .collect()
     };
-    AliasDefinition::new(name.trim(), parameters, expression)
-        .with_context(|| format!("Invalid hunkset alias `{}`", name.trim()))
+    let signature = AliasSignature::new(name.trim(), parameters)
+        .with_context(|| format!("Invalid hunkset alias signature `{}`", signature.trim()))?;
+    Ok(AliasSourceDefinition {
+        source_definition: definition.to_owned(),
+        signature,
+        expression: expression.trim().to_owned(),
+    })
+}
+
+fn build_alias_environment(definitions: Vec<AliasSourceDefinition>) -> Result<AliasEnvironment> {
+    let aliases = definitions
+        .into_iter()
+        .map(|definition| {
+            if definition.expression.is_empty() {
+                anyhow::bail!(
+                    "Alias `{}` has an empty expression",
+                    definition.signature.name()
+                );
+            }
+            let name = definition.signature.name().to_owned();
+            AliasDefinition::from_signature(definition.signature, &definition.expression)
+                .with_context(|| format!("Invalid hunkset alias `{name}`"))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    AliasEnvironment::new(aliases).context("Invalid hunkset alias configuration")
 }
 
 fn validate_query_entry(entry: &DiffSummaryEntry, path: &str) -> Result<()> {
@@ -2118,13 +2231,13 @@ fn run_jj_with_query(
     aliases: &[String],
     rev: Option<&str>,
 ) -> Result<()> {
-    let alias_environment = parse_alias_environment(aliases)?;
-    evaluate_with_aliases(query, &[], &alias_environment).context("Invalid hunkset query")?;
+    let aliases = resolve_alias_definitions(aliases)?;
+    evaluate_with_aliases(query, &[], &aliases.environment).context("Invalid hunkset query")?;
     let request = ListRequest {
         options: ListOptions {
             rev: rev.map(str::to_owned),
             query: Some(query.to_owned()),
-            aliases: aliases.to_owned(),
+            aliases: aliases.source_definitions,
             ..ListOptions::default()
         },
         summary_entries: read_diff_summary(rev)?,

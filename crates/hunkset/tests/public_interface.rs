@@ -61,28 +61,28 @@ fn evaluates_all_none_and_valid_non_matches() {
 }
 
 #[test]
-fn evaluates_files_against_each_path_independently() {
+fn evaluates_globs_against_each_path_independently() {
     assert_eq!(
-        indices("files(\"src/**\")"),
+        indices("glob(\"src/**\")"),
         HashSet::from([0, 2, 3, 5, 8, 9, 10])
     );
-    assert_eq!(indices("files(\"old/**\")"), HashSet::from([4, 11]));
-    assert_eq!(indices("files(\"*.sh\")"), HashSet::from([6]));
+    assert_eq!(indices("glob(\"old/**\")"), HashSet::from([4, 11]));
+    assert_eq!(indices("glob(\"*.sh\")"), HashSet::from([6]));
     assert_eq!(
-        indices("files((\"src/**\" | \"tests/**\") ~ \"**/new.rs\")"),
+        indices("glob((\"src/**\" | \"tests/**\") ~ \"**/new.rs\")"),
         HashSet::from([0, 1, 3, 5, 8, 9, 10])
     );
-    assert!(indices("files(~\"archive/**\")").contains(&5));
-    assert!(!indices("all() ~ files(\"archive/**\")").contains(&5));
+    assert!(indices("glob(~\"archive/**\")").contains(&5));
+    assert!(!indices("all() ~ glob(\"archive/**\")").contains(&5));
     assert_eq!(
-        indices("files(\"src/**/*.rs\")"),
+        indices("glob(\"src/**/*.rs\")"),
         HashSet::from([0, 2, 3, 5, 8, 9, 10])
     );
-    assert_eq!(indices("files(\"src/caf?.rs\")"), HashSet::from([10]));
-    assert!(indices("files(\"**/new.rs\")").contains(&2));
+    assert_eq!(indices("glob(\"src/caf?.rs\")"), HashSet::from([10]));
+    assert!(indices("glob(\"**/new.rs\")").contains(&2));
 
     let midsegment = [SelectableUnit::mode("renew.rs", "renew.rs").unwrap()];
-    assert!(evaluate("files(\"**/new.rs\")", &midsegment)
+    assert!(evaluate("glob(\"**/new.rs\")", &midsegment)
         .unwrap()
         .is_empty());
 }
@@ -97,15 +97,18 @@ fn literal_content_is_case_sensitive_and_uses_only_changed_sides() {
 
 #[test]
 fn explicit_text_and_path_sides_are_independent() {
-    assert_eq!(indices("added(\"timeout\")"), HashSet::from([0, 2, 8]));
-    assert_eq!(indices("removed(\"timeout\")"), HashSet::from([0, 4, 8]));
-    assert!(indices("before_files(\"archive/**\")").is_empty());
-    assert_eq!(indices("after_files(\"archive/**\")"), HashSet::from([5]));
+    assert_eq!(indices("added_text(\"timeout\")"), HashSet::from([0, 2, 8]));
     assert_eq!(
-        indices("before_files(\"src/client.rs\")"),
+        indices("removed_text(\"timeout\")"),
+        HashSet::from([0, 4, 8])
+    );
+    assert!(indices("before_glob(\"archive/**\")").is_empty());
+    assert_eq!(indices("after_glob(\"archive/**\")"), HashSet::from([5]));
+    assert_eq!(
+        indices("before_glob(\"src/client.rs\")"),
         HashSet::from([5])
     );
-    assert!(indices("after_files(\"src/client.rs\")").is_empty());
+    assert!(indices("after_glob(\"src/client.rs\")").is_empty());
 }
 
 #[test]
@@ -144,7 +147,7 @@ fn regex_matching_is_explicit_and_stays_within_one_changed_side() {
         1
     );
     assert_eq!(
-        evaluate("added(\"gamma\\ndelta\")", &multiline)
+        evaluate("added_text(\"gamma\\ndelta\")", &multiline)
             .unwrap()
             .len(),
         1
@@ -177,26 +180,26 @@ fn text_predicates_do_not_match_non_text_units() {
 #[test]
 fn evaluates_operators_with_the_agreed_precedence_and_associativity() {
     assert_eq!(
-        indices("files(\"src/**\") & content(\"timeout\") | files(\"*.sh\")"),
+        indices("glob(\"src/**\") & content(\"timeout\") | glob(\"*.sh\")"),
         HashSet::from([0, 2, 6, 8])
     );
     assert_eq!(
-        indices("all() ~ files(\"src/**\") & files(\"old/**\")"),
+        indices("all() ~ glob(\"src/**\") & glob(\"old/**\")"),
         HashSet::from([4, 11])
     );
     assert_eq!(
-        indices("~files(\"src/**\") & files(\"old/**\")"),
+        indices("~glob(\"src/**\") & glob(\"old/**\")"),
         HashSet::from([4, 11])
     );
     assert_eq!(
-        indices("files(\"src/**\") & (content(\"retry\") | content(\"timeout\"))"),
+        indices("glob(\"src/**\") & (content(\"retry\") | content(\"timeout\"))"),
         HashSet::from([0, 2, 8])
     );
 }
 
 #[test]
 fn conjunction_requires_the_same_occurrence() {
-    assert!(indices("files(\"src/**\") & content(\"retry\")").is_empty());
+    assert!(indices("glob(\"src/**\") & content(\"retry\")").is_empty());
     assert_eq!(
         indices("content(\"timeout = 10\") & content(\"timeout = 20\")"),
         HashSet::from([0, 8])
@@ -257,10 +260,38 @@ fn reports_invalid_syntax_unknown_functions_and_wrong_arguments() {
         "content() expects one string argument"
     );
 
-    let wrong_argument_type = evaluate("files(all())", &fixture()).unwrap_err();
+    let wrong_argument_type = evaluate("glob(all())", &fixture()).unwrap_err();
     assert!(wrong_argument_type
         .message()
         .contains("expected a string argument"));
+}
+
+#[test]
+fn rejects_replaced_predicate_names() {
+    for query in [
+        "creations()",
+        "deletions()",
+        "files(\"src/**\")",
+        "before_files(\"src/**\")",
+        "after_files(\"src/**\")",
+    ] {
+        let error = evaluate(query, &fixture()).unwrap_err();
+        assert!(
+            error.message().contains("unknown function or alias")
+                || error.message().contains("expected a function"),
+            "{query}: {error}"
+        );
+    }
+
+    assert!(evaluate("added(\"text\")", &fixture())
+        .unwrap_err()
+        .message()
+        .contains("expects no arguments"));
+    let removed = evaluate("removed(\"text\")", &fixture()).unwrap_err();
+    assert!(
+        removed.message().contains("unknown function or alias")
+            || removed.message().contains("expected a function")
+    );
 }
 
 #[test]
@@ -278,8 +309,8 @@ fn rejects_empty_paths_at_the_public_boundary() {
 
 #[test]
 fn selects_file_unit_kinds_independently() {
-    assert_eq!(indices("creations()"), HashSet::from([2, 3]));
-    assert_eq!(indices("deletions()"), HashSet::from([4, 11]));
+    assert_eq!(indices("added()"), HashSet::from([2, 3]));
+    assert_eq!(indices("deleted()"), HashSet::from([4, 11]));
     assert_eq!(indices("renames()"), HashSet::from([5]));
     assert_eq!(indices("modes()"), HashSet::from([6]));
     assert_eq!(indices("binaries()"), HashSet::from([7]));
@@ -293,26 +324,21 @@ fn selects_file_unit_kinds_independently() {
 #[test]
 fn aliases_expand_structurally_with_named_and_set_parameters() {
     let aliases = AliasEnvironment::new([
-        AliasDefinition::new("generated", Vec::<String>::new(), "files(\"src/new.rs\")").unwrap(),
+        AliasDefinition::new("generated", Vec::<String>::new(), "glob(\"src/new.rs\")").unwrap(),
         AliasDefinition::new(
             "handwritten",
             ["selection"],
             "(all() ~ generated()) & selection()",
         )
         .unwrap(),
-        AliasDefinition::new(
-            "under_src",
-            ["selection"],
-            "files(\"src/**\") & selection()",
-        )
-        .unwrap(),
+        AliasDefinition::new("under_src", ["selection"], "glob(\"src/**\") & selection()").unwrap(),
     ])
     .unwrap();
 
     let aliased =
         evaluate_with_aliases("handwritten(content(\"timeout\"))", &fixture(), &aliases).unwrap();
     let expanded = evaluate(
-        "(all() ~ files(\"src/new.rs\")) & content(\"timeout\")",
+        "(all() ~ glob(\"src/new.rs\")) & content(\"timeout\")",
         &fixture(),
     )
     .unwrap();
@@ -335,20 +361,20 @@ fn alias_configuration_and_expansion_errors_are_actionable() {
     for builtin in [
         "all",
         "none",
-        "files",
-        "before_files",
-        "after_files",
+        "glob",
+        "before_glob",
+        "after_glob",
         "content",
+        "added_text",
+        "removed_text",
         "added",
-        "removed",
+        "deleted",
         "regex",
         "added_regex",
         "removed_regex",
         "renames",
         "modes",
         "binaries",
-        "creations",
-        "deletions",
         "id",
     ] {
         let collision =
@@ -410,11 +436,11 @@ fn alias_configuration_and_expansion_errors_are_actionable() {
     )
     .unwrap()])
     .unwrap();
-    let compound_fileset = (0..16)
+    let compound_glob_expression = (0..16)
         .map(|index| format!("\"path-{index}\""))
         .collect::<Vec<_>>()
         .join(" | ");
-    let mut exponential = format!("files(({compound_fileset}))");
+    let mut exponential = format!("glob(({compound_glob_expression}))");
     for _ in 0..9 {
         exponential = format!("duplicate({exponential})");
     }
@@ -424,7 +450,7 @@ fn alias_configuration_and_expansion_errors_are_actionable() {
     let paths = AliasEnvironment::new([AliasDefinition::new(
         "paths",
         Vec::<String>::new(),
-        &format!("files(({compound_fileset}))"),
+        &format!("glob(({compound_glob_expression}))"),
     )
     .unwrap()])
     .unwrap();

@@ -5,18 +5,17 @@ use std::fmt;
 pub(crate) enum BuiltinArgument {
     None,
     String,
-    Fileset,
+    Glob,
 }
 
 pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
     match name {
-        "all" | "none" | "renames" | "modes" | "binaries" | "creations" | "deletions" => {
+        "all" | "none" | "renames" | "modes" | "binaries" | "added" | "deleted" => {
             Some(BuiltinArgument::None)
         }
-        "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" | "id" => {
-            Some(BuiltinArgument::String)
-        }
-        "files" | "before_files" | "after_files" => Some(BuiltinArgument::Fileset),
+        "content" | "added_text" | "removed_text" | "regex" | "added_regex" | "removed_regex"
+        | "id" => Some(BuiltinArgument::String),
+        "glob" | "before_glob" | "after_glob" => Some(BuiltinArgument::Glob),
         _ => None,
     }
 }
@@ -25,12 +24,12 @@ pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
 pub(crate) enum Expression {
     All,
     None,
-    Files(FilesetExpression),
-    BeforeFiles(FilesetExpression),
-    AfterFiles(FilesetExpression),
+    Glob(GlobExpression),
+    BeforeGlob(GlobExpression),
+    AfterGlob(GlobExpression),
     Content(String),
-    Added(String),
-    Removed(String),
+    AddedText(String),
+    RemovedText(String),
     Regex(regex::Regex),
     AddedRegex(regex::Regex),
     RemovedRegex(regex::Regex),
@@ -43,8 +42,8 @@ pub(crate) enum Expression {
     Renames,
     Modes,
     Binaries,
-    Creations,
-    Deletions,
+    Added,
+    Deleted,
     Union(Box<Expression>, Box<Expression>),
     Intersection(Box<Expression>, Box<Expression>),
     Difference(Box<Expression>, Box<Expression>),
@@ -52,12 +51,12 @@ pub(crate) enum Expression {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum FilesetExpression {
+pub(crate) enum GlobExpression {
     Pattern(String),
-    Union(Box<FilesetExpression>, Box<FilesetExpression>),
-    Intersection(Box<FilesetExpression>, Box<FilesetExpression>),
-    Difference(Box<FilesetExpression>, Box<FilesetExpression>),
-    Complement(Box<FilesetExpression>),
+    Union(Box<GlobExpression>, Box<GlobExpression>),
+    Intersection(Box<GlobExpression>, Box<GlobExpression>),
+    Difference(Box<GlobExpression>, Box<GlobExpression>),
+    Complement(Box<GlobExpression>),
 }
 
 /// A query parse error with a byte offset into the original query.
@@ -165,13 +164,13 @@ impl Parser<'_> {
         let function_offset = self.offset;
         let name = self.parse_identifier()?;
         self.expect('(')?;
-        if builtin_argument(&name) == Some(BuiltinArgument::Fileset) {
-            let fileset = self.parse_fileset_union()?;
+        if builtin_argument(&name) == Some(BuiltinArgument::Glob) {
+            let glob_expression = self.parse_glob_union()?;
             self.expect(')')?;
             return Ok(match name.as_str() {
-                "files" => Expression::Files(fileset),
-                "before_files" => Expression::BeforeFiles(fileset),
-                "after_files" => Expression::AfterFiles(fileset),
+                "glob" => Expression::Glob(glob_expression),
+                "before_glob" => Expression::BeforeGlob(glob_expression),
+                "after_glob" => Expression::AfterGlob(glob_expression),
                 _ => unreachable!(),
             });
         }
@@ -191,8 +190,8 @@ impl Parser<'_> {
             ("all", []) => Ok(Expression::All),
             ("none", []) => Ok(Expression::None),
             ("content", [argument]) => Ok(Expression::Content(argument.value.clone())),
-            ("added", [argument]) => Ok(Expression::Added(argument.value.clone())),
-            ("removed", [argument]) => Ok(Expression::Removed(argument.value.clone())),
+            ("added_text", [argument]) => Ok(Expression::AddedText(argument.value.clone())),
+            ("removed_text", [argument]) => Ok(Expression::RemovedText(argument.value.clone())),
             ("id", [argument]) => Ok(Expression::Id(
                 crate::OccurrenceId::parse(&argument.value)
                     .map_err(|error| QueryError::new(argument.offset, error.to_string()))?,
@@ -211,16 +210,14 @@ impl Parser<'_> {
             ("renames", []) => Ok(Expression::Renames),
             ("modes", []) => Ok(Expression::Modes),
             ("binaries", []) => Ok(Expression::Binaries),
-            ("creations", []) => Ok(Expression::Creations),
-            ("deletions", []) => Ok(Expression::Deletions),
-            ("all" | "none" | "renames" | "modes" | "binaries" | "creations" | "deletions", _) => {
-                Err(QueryError::new(
-                    function_offset,
-                    format!("{name}() expects no arguments"),
-                ))
-            }
+            ("added", []) => Ok(Expression::Added),
+            ("deleted", []) => Ok(Expression::Deleted),
+            ("all" | "none" | "renames" | "modes" | "binaries" | "added" | "deleted", _) => Err(
+                QueryError::new(function_offset, format!("{name}() expects no arguments")),
+            ),
             (
-                "content" | "added" | "removed" | "regex" | "added_regex" | "removed_regex" | "id",
+                "content" | "added_text" | "removed_text" | "regex" | "added_regex"
+                | "removed_regex" | "id",
                 _,
             ) => Err(QueryError::new(
                 function_offset,
@@ -246,31 +243,29 @@ impl Parser<'_> {
         Ok(arguments)
     }
 
-    fn parse_fileset_union(&mut self) -> Result<FilesetExpression, QueryError> {
-        let mut expression = self.parse_fileset_intersection_or_difference()?;
+    fn parse_glob_union(&mut self) -> Result<GlobExpression, QueryError> {
+        let mut expression = self.parse_glob_intersection_or_difference()?;
         while self.consume('|') {
-            expression = FilesetExpression::Union(
+            expression = GlobExpression::Union(
                 Box::new(expression),
-                Box::new(self.parse_fileset_intersection_or_difference()?),
+                Box::new(self.parse_glob_intersection_or_difference()?),
             );
         }
         Ok(expression)
     }
 
-    fn parse_fileset_intersection_or_difference(
-        &mut self,
-    ) -> Result<FilesetExpression, QueryError> {
-        let mut expression = self.parse_fileset_complement()?;
+    fn parse_glob_intersection_or_difference(&mut self) -> Result<GlobExpression, QueryError> {
+        let mut expression = self.parse_glob_complement()?;
         loop {
             if self.consume('&') {
-                expression = FilesetExpression::Intersection(
+                expression = GlobExpression::Intersection(
                     Box::new(expression),
-                    Box::new(self.parse_fileset_complement()?),
+                    Box::new(self.parse_glob_complement()?),
                 );
             } else if self.consume('~') {
-                expression = FilesetExpression::Difference(
+                expression = GlobExpression::Difference(
                     Box::new(expression),
-                    Box::new(self.parse_fileset_complement()?),
+                    Box::new(self.parse_glob_complement()?),
                 );
             } else {
                 return Ok(expression);
@@ -278,24 +273,24 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_fileset_complement(&mut self) -> Result<FilesetExpression, QueryError> {
+    fn parse_glob_complement(&mut self) -> Result<GlobExpression, QueryError> {
         if self.consume('~') {
-            Ok(FilesetExpression::Complement(Box::new(
-                self.parse_fileset_complement()?,
+            Ok(GlobExpression::Complement(Box::new(
+                self.parse_glob_complement()?,
             )))
         } else {
-            self.parse_fileset_primary()
+            self.parse_glob_primary()
         }
     }
 
-    fn parse_fileset_primary(&mut self) -> Result<FilesetExpression, QueryError> {
+    fn parse_glob_primary(&mut self) -> Result<GlobExpression, QueryError> {
         self.skip_whitespace();
         if self.consume_raw('(') {
-            let expression = self.parse_fileset_union()?;
+            let expression = self.parse_glob_union()?;
             self.expect(')')?;
             Ok(expression)
         } else {
-            self.parse_string().map(FilesetExpression::Pattern)
+            self.parse_string().map(GlobExpression::Pattern)
         }
     }
 

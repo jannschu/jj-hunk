@@ -94,11 +94,17 @@ pub struct AliasDefinition {
     expression: parser::Expression,
 }
 
-impl AliasDefinition {
+/// One validated alias signature without its expression body.
+#[derive(Clone, Debug)]
+pub struct AliasSignature {
+    name: String,
+    parameters: Vec<String>,
+}
+
+impl AliasSignature {
     pub fn new(
         name: impl Into<String>,
         parameters: impl IntoIterator<Item = impl Into<String>>,
-        expression: &str,
     ) -> Result<Self, QueryError> {
         let name = name.into();
         validate_alias_name(&name)?;
@@ -119,9 +125,28 @@ impl AliasDefinition {
                 ));
             }
         }
+        Ok(Self { name, parameters })
+    }
+
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+impl AliasDefinition {
+    pub fn new(
+        name: impl Into<String>,
+        parameters: impl IntoIterator<Item = impl Into<String>>,
+        expression: &str,
+    ) -> Result<Self, QueryError> {
+        let signature = AliasSignature::new(name, parameters)?;
+        Self::from_signature(signature, expression)
+    }
+
+    pub fn from_signature(signature: AliasSignature, expression: &str) -> Result<Self, QueryError> {
         Ok(Self {
-            name,
-            parameters,
+            name: signature.name,
+            parameters: signature.parameters,
             expression: parser::parse(expression)?,
         })
     }
@@ -489,10 +514,10 @@ fn expand_aliases(
             depth,
             remaining_nodes,
         )?)),
-        Expression::Files(fileset)
-        | Expression::BeforeFiles(fileset)
-        | Expression::AfterFiles(fileset) => {
-            consume_expansion_nodes(remaining_nodes, fileset_nodes(fileset))?;
+        Expression::Glob(glob_expression)
+        | Expression::BeforeGlob(glob_expression)
+        | Expression::AfterGlob(glob_expression) => {
+            consume_expansion_nodes(remaining_nodes, glob_expression_nodes(glob_expression))?;
             expression.clone()
         }
         other => other.clone(),
@@ -518,23 +543,23 @@ fn expression_nodes(expression: &parser::Expression) -> usize {
         Expression::Call { arguments, .. } => {
             1 + arguments.iter().map(expression_nodes).sum::<usize>()
         }
-        Expression::Files(fileset)
-        | Expression::BeforeFiles(fileset)
-        | Expression::AfterFiles(fileset) => 1 + fileset_nodes(fileset),
+        Expression::Glob(glob_expression)
+        | Expression::BeforeGlob(glob_expression)
+        | Expression::AfterGlob(glob_expression) => 1 + glob_expression_nodes(glob_expression),
         _ => 1,
     }
 }
 
-fn fileset_nodes(expression: &parser::FilesetExpression) -> usize {
-    use parser::FilesetExpression;
+fn glob_expression_nodes(expression: &parser::GlobExpression) -> usize {
+    use parser::GlobExpression;
     match expression {
-        FilesetExpression::Pattern(_) => 1,
-        FilesetExpression::Union(left, right)
-        | FilesetExpression::Intersection(left, right)
-        | FilesetExpression::Difference(left, right) => {
-            1 + fileset_nodes(left) + fileset_nodes(right)
+        GlobExpression::Pattern(_) => 1,
+        GlobExpression::Union(left, right)
+        | GlobExpression::Intersection(left, right)
+        | GlobExpression::Difference(left, right) => {
+            1 + glob_expression_nodes(left) + glob_expression_nodes(right)
         }
-        FilesetExpression::Complement(inner) => 1 + fileset_nodes(inner),
+        GlobExpression::Complement(inner) => 1 + glob_expression_nodes(inner),
     }
 }
 
@@ -564,31 +589,31 @@ fn evaluate_expression(
     match expression {
         Expression::All => universe.clone(),
         Expression::None => HashSet::new(),
-        Expression::Files(fileset) => matching_keys(units, |unit| {
+        Expression::Glob(glob_expression) => matching_keys(units, |unit| {
             unit.old_path
                 .iter()
                 .chain(unit.new_path.iter())
-                .any(|path| evaluate_fileset(fileset, path))
+                .any(|path| evaluate_glob_expression(glob_expression, path))
         }),
-        Expression::BeforeFiles(fileset) => matching_keys(units, |unit| {
+        Expression::BeforeGlob(glob_expression) => matching_keys(units, |unit| {
             unit.old_path
                 .as_deref()
-                .is_some_and(|path| evaluate_fileset(fileset, path))
+                .is_some_and(|path| evaluate_glob_expression(glob_expression, path))
         }),
-        Expression::AfterFiles(fileset) => matching_keys(units, |unit| {
+        Expression::AfterGlob(glob_expression) => matching_keys(units, |unit| {
             unit.new_path
                 .as_deref()
-                .is_some_and(|path| evaluate_fileset(fileset, path))
+                .is_some_and(|path| evaluate_glob_expression(glob_expression, path))
         }),
         Expression::Content(literal) => matching_keys(units, |unit| {
             changed_sides(&unit.change)
                 .into_iter()
                 .any(|side| side.contains(literal))
         }),
-        Expression::Added(literal) => matching_keys(units, |unit| {
+        Expression::AddedText(literal) => matching_keys(units, |unit| {
             added_side(&unit.change).is_some_and(|side| side.contains(literal))
         }),
-        Expression::Removed(literal) => matching_keys(units, |unit| {
+        Expression::RemovedText(literal) => matching_keys(units, |unit| {
             removed_side(&unit.change).is_some_and(|side| side.contains(literal))
         }),
         Expression::Regex(regex) => matching_keys(units, |unit| {
@@ -607,10 +632,10 @@ fn evaluate_expression(
         Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
         Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),
         Expression::Binaries => matching_keys(units, |unit| matches!(unit.change, Change::Binary)),
-        Expression::Creations => {
+        Expression::Added => {
             matching_keys(units, |unit| matches!(unit.change, Change::Creation { .. }))
         }
-        Expression::Deletions => {
+        Expression::Deleted => {
             matching_keys(units, |unit| matches!(unit.change, Change::Deletion { .. }))
         }
         Expression::Union(left, right) => {
@@ -635,21 +660,21 @@ fn evaluate_expression(
     }
 }
 
-fn evaluate_fileset(expression: &parser::FilesetExpression, path: &str) -> bool {
-    use parser::FilesetExpression;
+fn evaluate_glob_expression(expression: &parser::GlobExpression, path: &str) -> bool {
+    use parser::GlobExpression;
 
     match expression {
-        FilesetExpression::Pattern(pattern) => fileset_matches(pattern, path),
-        FilesetExpression::Union(left, right) => {
-            evaluate_fileset(left, path) || evaluate_fileset(right, path)
+        GlobExpression::Pattern(pattern) => glob_matches(pattern, path),
+        GlobExpression::Union(left, right) => {
+            evaluate_glob_expression(left, path) || evaluate_glob_expression(right, path)
         }
-        FilesetExpression::Intersection(left, right) => {
-            evaluate_fileset(left, path) && evaluate_fileset(right, path)
+        GlobExpression::Intersection(left, right) => {
+            evaluate_glob_expression(left, path) && evaluate_glob_expression(right, path)
         }
-        FilesetExpression::Difference(left, right) => {
-            evaluate_fileset(left, path) && !evaluate_fileset(right, path)
+        GlobExpression::Difference(left, right) => {
+            evaluate_glob_expression(left, path) && !evaluate_glob_expression(right, path)
         }
-        FilesetExpression::Complement(inner) => !evaluate_fileset(inner, path),
+        GlobExpression::Complement(inner) => !evaluate_glob_expression(inner, path),
     }
 }
 
@@ -687,14 +712,14 @@ fn removed_side(change: &Change) -> Option<&str> {
     }
 }
 
-fn fileset_matches(pattern: &str, path: &str) -> bool {
+fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let path = path.chars().collect::<Vec<_>>();
     let mut answers = vec![vec![None; path.len() + 1]; pattern.len() + 1];
-    fileset_matches_from(&pattern, &path, 0, 0, &mut answers)
+    glob_matches_from(&pattern, &path, 0, 0, &mut answers)
 }
 
-fn fileset_matches_from(
+fn glob_matches_from(
     pattern: &[char],
     path: &[char],
     pattern_index: usize,
@@ -717,25 +742,25 @@ fn fileset_matches_from(
                 || path_index == 0
                 || path.get(path_index - 1) == Some(&'/');
             (can_end_directories
-                && fileset_matches_from(pattern, path, suffix_index, path_index, answers))
+                && glob_matches_from(pattern, path, suffix_index, path_index, answers))
                 || (path_index < path.len()
-                    && fileset_matches_from(pattern, path, pattern_index, path_index + 1, answers))
+                    && glob_matches_from(pattern, path, pattern_index, path_index + 1, answers))
         }
         Some('*') => {
-            fileset_matches_from(pattern, path, pattern_index + 1, path_index, answers)
+            glob_matches_from(pattern, path, pattern_index + 1, path_index, answers)
                 || (path
                     .get(path_index)
                     .is_some_and(|character| *character != '/')
-                    && fileset_matches_from(pattern, path, pattern_index, path_index + 1, answers))
+                    && glob_matches_from(pattern, path, pattern_index, path_index + 1, answers))
         }
         Some('?') => {
             path.get(path_index)
                 .is_some_and(|character| *character != '/')
-                && fileset_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
+                && glob_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
         }
         Some(literal) => {
             path.get(path_index) == Some(literal)
-                && fileset_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
+                && glob_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
         }
     };
     answers[pattern_index][path_index] = Some(answer);

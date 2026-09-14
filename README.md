@@ -32,10 +32,10 @@ jj-hunk list --rev @
 jj-hunk list --format yaml
 
 # Select whole text blocks with a query; revision scope stays separate
-jj-hunk list -r @ --query 'files("src/**") & content("timeout")'
+jj-hunk list -r @ --query 'glob("src/**") & content("timeout")'
 
 # Apply the same query selection while the other changes stay in the working copy
-jj-hunk commit --query 'files("src/fix.rs")' "bug fix"
+jj-hunk commit --query 'glob("src/fix.rs")' "bug fix"
 
 # List files only (hunk counts)
 jj-hunk list --files
@@ -97,10 +97,10 @@ Mutation commands accept `--query` as an alternative to a spec. Query evaluation
 
 ### Query predicates
 
-- `content("text")` searches either changed text side. `added("text")` and `removed("text")` search only that side.
+- `content("text")` searches either changed text side. `added_text("text")` and `removed_text("text")` search only that side.
 - `regex("pattern")` searches either changed text side. `added_regex("pattern")` and `removed_regex("pattern")` search only that side. Regex syntax is the Rust `regex` syntax; inline flags such as `(?i)` are explicit. Escape a regex backslash in the query string, for example `regex("timeout\\s*=\\s*\\d+")`.
-- `files(<fileset>)` matches either path. `before_files(<fileset>)` and `after_files(<fileset>)` match only that path. A fileset supports string globs, `|`, `&`, binary `~`, unary `~`, and parentheses.
-- `creations()`, `deletions()`, `renames()`, `modes()`, and `binaries()` select indivisible file changes. `all()` and `none()` select the full or empty occurrence set.
+- `glob(<glob-expression>)` matches either path. `before_glob(<glob-expression>)` and `after_glob(<glob-expression>)` match only that path. A glob expression supports quoted glob patterns, `|`, `&`, binary `~`, unary `~`, and parentheses. This is a small hunkset grammar; it does not accept the full `jj` fileset language or its functions.
+- `added()`, `deleted()`, `renames()`, `modes()`, and `binaries()` select indivisible file changes. `all()` and `none()` select the full or empty occurrence set.
 - `id("hunk-<64 hex characters>")` selects one exact occurrence ID from list output. Prefix matching is not supported.
 
 Literal and regex matching is case-sensitive by default. Text predicates search changed text only, not unchanged context. A multiline pattern can span consecutive lines within one removed or added side. It cannot cross from removed text to added text. Hunkset expressions compose with `|`, `&`, binary `~`, unary `~`, and parentheses.
@@ -111,14 +111,24 @@ Use repeatable global `--alias 'name(parameters)=expression'` options. Parameter
 
 ```bash
 jj-hunk \
-  --alias 'generated()=files("generated/**")' \
+  --alias 'generated()=glob("generated/**")' \
   --alias 'handwritten(selection)=(all() ~ generated()) & selection()' \
   list --query 'handwritten(content("timeout"))'
 ```
 
-The same options work with `split`, `commit`, and `squash`. Alias arguments are parsed expressions, so substitution preserves parentheses and operator precedence. Alias definition syntax, names, builtin collisions, duplicate names and parameters, and body syntax are validated when the environment is built. Wrong arity, unknown names, cycles, more than 32 nested expansions, and more than 10,000 expanded expression or fileset nodes are checked when a query references the alias. All checks for the requested query finish before a mutation starts; unused alias bodies are not recursively resolved.
+The same options work with `split`, `commit`, and `squash`. Alias arguments are parsed expressions, so substitution preserves parentheses and operator precedence. Alias definition syntax, names, builtin collisions, duplicate names and parameters, and body syntax are validated when the environment is built. Wrong arity, unknown names, cycles, more than 32 nested expansions, and more than 10,000 expanded expression or glob-expression nodes are checked when a query references the alias. All checks for the requested query finish before a mutation starts; unused alias bodies are not recursively resolved.
 
-The `hunkset` library does not read CLI or repository configuration. Callers construct aliases explicitly with `AliasDefinition::new`, collect them with `AliasEnvironment::new`, and call `evaluate_with_aliases`. `evaluate` uses an empty alias environment.
+Aliases can also be stored in effective `jj` configuration. Quote each signature because TOML bare keys cannot contain parentheses:
+
+```toml
+[hunkset-aliases]
+"generated()" = 'glob("generated/**")'
+"handwritten(selection)" = '(all() ~ generated()) & selection()'
+```
+
+`jj-hunk` reads the effective values through `jj config`, so normal user, repository, and workspace precedence applies. A `--alias` definition replaces a configured definition with the same alias name, including its parameter signature. Duplicate configured names and duplicate command-line names remain errors because alias overloading is not supported.
+
+The `hunkset` library does not read CLI or repository configuration. `jj-hunk` loads configuration and supplies an explicit environment. Other callers construct aliases with `AliasDefinition::new`, collect them with `AliasEnvironment::new`, and call `evaluate_with_aliases`. `evaluate` uses an empty alias environment.
 
 ## Spec Format
 

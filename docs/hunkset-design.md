@@ -21,8 +21,8 @@ out of scope until a later feature needs them.
 - Multiple conditions must match the same unit, but can match different lines or
   different sides. Multiline matches can span consecutive lines on one side,
   never across removed and added text.
-- File predicates match either old or new path by default, with explicit side
-  forms. Evaluate the whole fileset independently against each path.
+- Glob predicates match either old or new path by default, with explicit side
+  forms. Evaluate the whole glob expression independently against each path.
 - Pure rename, mode, and binary units do not match text predicates. Complement
   can therefore retain them.
 - Support union, intersection, difference, complement, and parentheses.
@@ -35,14 +35,17 @@ out of scope until a later feature needs them.
   the caller controls display order.
 - Support named aliases and set-expression parameters through an environment
   explicitly supplied by the caller.
+- `jj-hunk` loads alias definitions from the effective `[hunkset-aliases]`
+  configuration and lets command-line definitions replace configured aliases by
+  name. The `hunkset` library remains independent of configuration and I/O.
 - Selecting a rename does not select text changes in its file, or the reverse.
 
 Example:
 
 ```text
-(files("src/**") & renames())
+(glob("src/**") & renames())
 |
-((files("src/**") | files("tests/**")) & content("timeout"))
+((glob("src/**") | glob("tests/**")) & content("timeout"))
 ```
 
 This selects all renames under src, plus timeout text blocks under src or tests.
@@ -107,7 +110,7 @@ or publish the crate yet.
 First user-visible query form:
 
 ```sh
-jj-hunk list -r @ --query 'files("src/**") & content("timeout")'
+jj-hunk list -r @ --query 'glob("src/**") & content("timeout")'
 ```
 
 ## Pre-implementation observations (historical)
