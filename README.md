@@ -4,6 +4,8 @@ Select parts of a diff in [jj (Jujutsu)](https://github.com/martinvonz/jj), with
 
 Turn a large, multi-file diff into focused commits. Select a fix and its tests while leaving unrelated edits in the same files for another commit. Use `split`, `commit`, or `squash` with one of three selection formats: [hunkset](#1-hunkset), [JSON](#2-json), or [YAML](#3-yaml).
 
+The hunkset query language was first created by [Yann Hodique (@sigma)](https://github.com/sigma) in his [jj-hunk fork](https://github.com/sigma/jj-hunk/tree/dev#hunkset-query-language) and proposed in [RFC: hunkset language (#7)](https://github.com/laulauland/jj-hunk/issues/7). His prototype inspired the implementation in this repository.
+
 ## One diff, two logical changes
 
 Suppose you increased a timeout and changed logging in two existing files:
