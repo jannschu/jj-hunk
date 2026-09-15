@@ -41,8 +41,8 @@ The examples below are alternatives: each selects only the timeout replacements,
 Describe which edit blocks you want. Preview the selection, then split it into a commit:
 
 ```bash
-jj-hunk list --format text --query 'added_text("timeout")'
-jj-hunk split --query 'added_text("timeout")' "fix: increase request timeout"
+jj-hunk list --format text --query 'added(content:"timeout")'
+jj-hunk split --query 'added(content:"timeout")' "fix: increase request timeout"
 ```
 
 The timeout replacements go into the first commit. The logging replacements remain in the other change.
@@ -50,10 +50,10 @@ The timeout replacements go into the first commit. The logging replacements rema
 You can combine content and path predicates:
 
 ```bash
-jj-hunk list --query 'glob("src/**" | "tests/**") & added_text("timeout")'
+jj-hunk list --query 'added(path:glob:"src/**" | glob:"tests/**", content:"timeout")'
 ```
 
-A fileset selects paths; a hunkset selects change units within those paths. `glob(...)` alone selects all change units in matching files. The content predicate narrows that result to specific blocks. You define the purpose through the query; the tool does not infer change meaning.
+A fileset selects paths; a hunkset selects change units within those paths. `changed(path:glob:"src/**")` selects all change units with a matching path. Adding a content condition narrows the result to specific blocks. You define the purpose through the query; the tool does not infer change meaning.
 
 Use this form when a text pattern, path, change kind, or combination of predicates describes the selection. See [hunkset predicates](#hunkset-predicates) and [aliases](#aliases).
 
@@ -146,10 +146,10 @@ For `[selection]`, use either `--query 'expression'` or `--spec-file path.json` 
 
 ```bash
 # Commit matching edits without including other edits in the same files
-jj-hunk commit --query 'added_text("timeout")' "fix: increase request timeout"
+jj-hunk commit --query 'added(content:"timeout")' "fix: increase request timeout"
 
 # Move matching edits from a specific revision into its parent
-jj-hunk squash -r @- --query 'added_text("timeout")'
+jj-hunk squash -r @- --query 'added(content:"timeout")'
 ```
 
 List, split, and squash accept `-r <rev>` (default: `@`). The revset must resolve to one revision. Commit always operates on the working copy. Revision scope stays separate from the hunkset expression.
@@ -160,13 +160,74 @@ A valid query that selects nothing is a no-op for split, commit, and squash. Que
 
 ### Hunkset predicates
 
-- `content("text")` searches either changed text side. `added_text("text")` and `removed_text("text")` search only that side.
-- `regex("pattern")` searches either changed text side. `added_regex("pattern")` and `removed_regex("pattern")` search only that side. Regex syntax is the Rust `regex` syntax; inline flags such as `(?i)` are explicit. Escape a regex backslash in the query string, for example `regex("timeout\\s*=\\s*\\d+")`.
-- `glob(<glob-expression>)` matches either path. `before_glob(<glob-expression>)` and `after_glob(<glob-expression>)` match only that path. A glob expression supports quoted glob patterns, `|`, `&`, binary `~`, unary `~`, and parentheses. This is a small hunkset grammar; it does not accept the full `jj` fileset language or its functions.
-- `added()`, `deleted()`, `renames()`, `modes()`, and `binaries()` select indivisible file changes. `all()` and `none()` select the full or empty occurrence set.
-- `id("hunk-<64 hex characters>")` selects one exact occurrence ID from list output. Prefix matching is not supported.
+The function names the operation. Arguments restrict paths or content. Multiple arguments must match the same change unit.
 
-Literal and regex matching is case-sensitive by default. Text predicates search changed text only, not unchanged context. A multiline pattern can span consecutive lines within one removed or added side. It cannot cross from removed text to added text. Hunkset expressions compose with `|`, `&`, binary `~`, unary `~`, and parentheses.
+| Function | Selects |
+|----------|---------|
+| `changed(...)` | Any change unit; `content:` searches either changed-text side |
+| `added(...)` | Blocks with added text, or whole added files |
+| `removed(...)` | Blocks with removed text, or whole deleted files |
+| `renamed(...)` | Rename units only |
+| `mode_changed(...)` | Executable-mode change units only |
+| `binary_changed(...)` | Binary-content change units only |
+| `all()` / `none()` | The full / empty set |
+| `id("hunk-<64 hex characters>")` | One exact occurrence; no abbreviated hashes |
+
+#### Paths, files, and content
+
+```text
+added(content:"timeout")
+added(path:glob:"src/**", content:"timeout")
+added(file:glob:"src/**")
+added(file:glob:"src/**", content:"timeout")
+```
+
+- `path:` means **where**: match either path without requiring file creation or deletion.
+- `file:` means **the file itself** was added or removed. It is available only on `added()` and `removed()`, and selects whole file operations.
+- `content:` searches only added text for `added()`, only removed text for `removed()`, and either changed-text side for `changed()`.
+
+Thus `added(content:"timeout")` can select a replacement block in an existing file or an entire new file whose contents match. `added(file:glob:"src/**", content:"timeout")` selects only matching new files. An empty new file matches `file:`, but cannot match the nonempty substring `content:"timeout"`. Binary file creations and deletions can match `file:`; their bytes are not treated as searchable text.
+
+With no arguments, `added()` and `removed()` include their respective text and whole-file operations. `changed()` is equivalent to `all()`.
+
+An empty text file still has a content value: `added(file:glob:"**", content:exact:"")` selects empty new text files. A missing side of a text block has no value and cannot match this query.
+
+Use `before_path:` and `after_path:` when the old/new path matters. On `renamed()`, `from:` and `to:` make the direction explicit:
+
+```text
+renamed(from:glob:"src/**", to:glob:"archive/**")
+
+removed(
+  before_path:glob:"src/**",
+  after_path:glob:"archive/**",
+  content:"legacy_init("
+)
+```
+
+The first query selects moves, not text edits within moved files. The second selects matching text blocks within those moved files, not their rename units. Combine them with `|` to select both.
+
+#### Pattern modifiers and composition
+
+Content defaults to case-sensitive substring matching. Paths default to glob matching. Use an explicit modifier to choose the matching rule:
+
+```text
+added(content:regex:"timeout|deadline")
+changed(path:regex:"^src/.*[.]rs$", content:substring:"authenticate")
+added(file:exact:"src/client.rs")
+```
+
+Supported modifiers are `substring:`, `exact:`, `glob:`, and `regex:`. Glob patterns support `*`, `**`, and `?`; this is not the full jj fileset language. Regex patterns use Rust's `regex` syntax, with explicit inline flags such as `(?i)`. Escape backslashes inside query strings, for example `added(content:regex:"timeout\\s*=\\s*\\d+")`.
+
+Patterns within a field can use `|`, `&`, binary `~`, unary `~`, and parentheses. Each pattern expression is evaluated against one available path or text side at a time. Missing sides do not match, even for negated patterns. Top-level set operators combine whole change units:
+
+```text
+removed(path:glob:"src/**", content:"fetch_user(")
+& added(content:"load_user(")
+```
+
+This selects blocks that remove the old call and add the new call. Both conditions must match the same block. A multiline content match can span consecutive lines on one side, but cannot cross from removed text to added text. Unchanged context is never searched.
+
+Unknown fields, repeated fields, unsupported fields for an operation, and invalid patterns are errors. Alias parameters remain set expressions, not pattern parameters. See the [0.5.1 migration notes](docs/releases/v0.5.1.md) for changes from the old function spellings.
 
 ### Aliases
 
@@ -174,19 +235,19 @@ Use repeatable global `--alias 'name(parameters)=expression'` options. Parameter
 
 ```bash
 jj-hunk \
-  --alias 'timeout_change()=added_text("timeout")' \
-  --alias 'handwritten(selection)=selection() ~ glob("generated/**")' \
+  --alias 'timeout_change()=added(content:"timeout")' \
+  --alias 'handwritten(selection)=selection() ~ changed(path:glob:"generated/**")' \
   list --query 'handwritten(timeout_change())'
 ```
 
-The same options work with `split`, `commit`, and `squash`. Alias arguments are parsed expressions, so substitution preserves parentheses and operator precedence. Alias definition syntax, names, builtin collisions, duplicate names and parameters, and body syntax are validated when the environment is built. Wrong arity, unknown names, cycles, more than 32 nested expansions, and more than 10,000 expanded expression or glob-expression nodes are checked when a query references the alias. All checks for the requested query finish before a mutation starts; unused alias bodies are not recursively resolved.
+The same options work with `split`, `commit`, and `squash`. Alias arguments are parsed expressions, so substitution preserves parentheses and operator precedence. Alias definition syntax, names, builtin collisions, duplicate names and parameters, and body syntax are validated when the environment is built. Wrong arity, unknown names, cycles, more than 32 nested expansions, and more than 10,000 expanded expression or pattern-expression nodes are checked when a query references the alias. All checks for the requested query finish before a mutation starts; unused alias bodies are not recursively resolved.
 
 Aliases can also be stored in effective `jj` configuration. Quote each signature because TOML bare keys cannot contain parentheses:
 
 ```toml
 [hunkset-aliases]
-"timeout_change()" = 'added_text("timeout")'
-"handwritten(selection)" = 'selection() ~ glob("generated/**")'
+"timeout_change()" = 'added(content:"timeout")'
+"handwritten(selection)" = 'selection() ~ changed(path:glob:"generated/**")'
 ```
 
 `jj-hunk` reads the effective values through `jj config`, so normal user, repository, and workspace precedence applies. A `--alias` definition replaces a configured definition with the same alias name, including its parameter signature. Duplicate configured names and duplicate command-line names remain errors because alias overloading is not supported.

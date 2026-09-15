@@ -1,8 +1,8 @@
 # Hunkset language: decisions and implementation
 
-Status: implementation record, 2026-09-13. All six stages are implemented,
-tested, and accepted after standards and spec reviews. Parked decisions remain
-out of scope until a later feature needs them.
+Status: implementation record. The original six stages shipped in 0.5.0.
+The 0.5.1 interface uses operation-first predicates and named pattern arguments.
+Parked decisions remain out of scope until a later feature needs them.
 
 ## Working decisions
 
@@ -21,8 +21,17 @@ out of scope until a later feature needs them.
 - Multiple conditions must match the same unit, but can match different lines or
   different sides. Multiline matches can span consecutive lines on one side,
   never across removed and added text.
-- Glob predicates match either old or new path by default, with explicit side
-  forms. Evaluate the whole glob expression independently against each path.
+- Path arguments match either old or new path by default, with explicit
+  before_path/after_path fields; renamed() also supports from/to. Evaluate each
+  pattern expression independently against each available path or text side.
+- Operation-first functions are changed, added, removed, renamed, mode_changed,
+  and binary_changed, plus all/none/id. No kind argument is needed: path means
+  location; file on added/removed restricts selection to whole-file operations.
+  Content on added/removed searches that text side, including initial/deleted
+  text of file units. A content match never splits an indivisible unit.
+- Pattern modifiers substring/exact/glob/regex describe matching independently
+  from the field. Content defaults to substring; paths default to glob. Reject
+  unknown, duplicate, or operation-incompatible fields before evaluation.
 - Pure rename, mode, and binary units do not match text predicates. Complement
   can therefore retain them.
 - Support union, intersection, difference, complement, and parentheses.
@@ -43,9 +52,9 @@ out of scope until a later feature needs them.
 Example:
 
 ```text
-(glob("src/**") & renames())
+renamed(path:glob:"src/**")
 |
-((glob("src/**") | glob("tests/**")) & content("timeout"))
+changed(path:glob:"src/**" | glob:"tests/**", content:"timeout")
 ```
 
 This selects all renames under src, plus timeout text blocks under src or tests.
@@ -107,10 +116,10 @@ or publish the crate yet.
    file units. The legacy spec format continues to use text IDs and whole-file
    actions; file-unit IDs are available through query output and `id()`.
 
-First user-visible query form:
+Current user-visible query form:
 
 ```sh
-jj-hunk list -r @ --query 'glob("src/**") & content("timeout")'
+jj-hunk list -r @ --query 'changed(path:glob:"src/**", content:"timeout")'
 ```
 
 ## Pre-implementation observations (historical)

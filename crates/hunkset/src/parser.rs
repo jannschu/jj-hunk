@@ -5,17 +5,16 @@ use std::fmt;
 pub(crate) enum BuiltinArgument {
     None,
     String,
-    Glob,
+    Fields,
 }
 
 pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
     match name {
-        "all" | "none" | "renames" | "modes" | "binaries" | "added" | "deleted" => {
-            Some(BuiltinArgument::None)
+        "all" | "none" => Some(BuiltinArgument::None),
+        "id" => Some(BuiltinArgument::String),
+        "changed" | "added" | "removed" | "renamed" | "mode_changed" | "binary_changed" => {
+            Some(BuiltinArgument::Fields)
         }
-        "content" | "added_text" | "removed_text" | "regex" | "added_regex" | "removed_regex"
-        | "id" => Some(BuiltinArgument::String),
-        "glob" | "before_glob" | "after_glob" => Some(BuiltinArgument::Glob),
         _ => None,
     }
 }
@@ -24,39 +23,70 @@ pub(crate) fn builtin_argument(name: &str) -> Option<BuiltinArgument> {
 pub(crate) enum Expression {
     All,
     None,
-    Glob(GlobExpression),
-    BeforeGlob(GlobExpression),
-    AfterGlob(GlobExpression),
-    Content(String),
-    AddedText(String),
-    RemovedText(String),
-    Regex(regex::Regex),
-    AddedRegex(regex::Regex),
-    RemovedRegex(regex::Regex),
+    Operation {
+        kind: OperationKind,
+        fields: Vec<Field>,
+    },
     Id(crate::OccurrenceId),
     Call {
         name: String,
         arguments: Vec<Expression>,
         offset: usize,
     },
-    Renames,
-    Modes,
-    Binaries,
-    Added,
-    Deleted,
     Union(Box<Expression>, Box<Expression>),
     Intersection(Box<Expression>, Box<Expression>),
     Difference(Box<Expression>, Box<Expression>),
     Complement(Box<Expression>),
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum GlobExpression {
-    Pattern(String),
-    Union(Box<GlobExpression>, Box<GlobExpression>),
-    Intersection(Box<GlobExpression>, Box<GlobExpression>),
-    Difference(Box<GlobExpression>, Box<GlobExpression>),
-    Complement(Box<GlobExpression>),
+#[derive(Clone, Debug)]
+pub(crate) enum PatternExpression {
+    Pattern(Pattern),
+    Union(Box<PatternExpression>, Box<PatternExpression>),
+    Intersection(Box<PatternExpression>, Box<PatternExpression>),
+    Difference(Box<PatternExpression>, Box<PatternExpression>),
+    Complement(Box<PatternExpression>),
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum Pattern {
+    Substring(String),
+    Exact(String),
+    Glob(String),
+    Regex(regex::Regex),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum OperationKind {
+    Changed,
+    Added,
+    Removed,
+    Renamed,
+    ModeChanged,
+    BinaryChanged,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum FieldKind {
+    Path,
+    BeforePath,
+    AfterPath,
+    File,
+    Content,
+    From,
+    To,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct Field {
+    pub kind: FieldKind,
+    pub pattern: PatternExpression,
+}
+
+#[derive(Clone, Copy)]
+enum DefaultPattern {
+    Glob,
+    Substring,
 }
 
 /// A query parse error with a byte offset into the original query.
@@ -164,15 +194,19 @@ impl Parser<'_> {
         let function_offset = self.offset;
         let name = self.parse_identifier()?;
         self.expect('(')?;
-        if builtin_argument(&name) == Some(BuiltinArgument::Glob) {
-            let glob_expression = self.parse_glob_union()?;
-            self.expect(')')?;
-            return Ok(match name.as_str() {
-                "glob" => Expression::Glob(glob_expression),
-                "before_glob" => Expression::BeforeGlob(glob_expression),
-                "after_glob" => Expression::AfterGlob(glob_expression),
+        if builtin_argument(&name) == Some(BuiltinArgument::Fields) {
+            let kind = match name.as_str() {
+                "changed" => OperationKind::Changed,
+                "added" => OperationKind::Added,
+                "removed" => OperationKind::Removed,
+                "renamed" => OperationKind::Renamed,
+                "mode_changed" => OperationKind::ModeChanged,
+                "binary_changed" => OperationKind::BinaryChanged,
                 _ => unreachable!(),
-            });
+            };
+            let fields = self.parse_fields(kind)?;
+            self.expect(')')?;
+            return Ok(Expression::Operation { kind, fields });
         }
         if builtin_argument(&name).is_none() {
             let arguments = self.parse_expression_arguments()?;
@@ -189,37 +223,15 @@ impl Parser<'_> {
         match (name.as_str(), arguments.as_slice()) {
             ("all", []) => Ok(Expression::All),
             ("none", []) => Ok(Expression::None),
-            ("content", [argument]) => Ok(Expression::Content(argument.value.clone())),
-            ("added_text", [argument]) => Ok(Expression::AddedText(argument.value.clone())),
-            ("removed_text", [argument]) => Ok(Expression::RemovedText(argument.value.clone())),
             ("id", [argument]) => Ok(Expression::Id(
                 crate::OccurrenceId::parse(&argument.value)
                     .map_err(|error| QueryError::new(argument.offset, error.to_string()))?,
             )),
-            ("regex" | "added_regex" | "removed_regex", [argument]) => {
-                let regex = regex::Regex::new(&argument.value).map_err(|error| {
-                    QueryError::new(argument.offset, format!("invalid regex: {error}"))
-                })?;
-                Ok(match name.as_str() {
-                    "regex" => Expression::Regex(regex),
-                    "added_regex" => Expression::AddedRegex(regex),
-                    "removed_regex" => Expression::RemovedRegex(regex),
-                    _ => unreachable!(),
-                })
-            }
-            ("renames", []) => Ok(Expression::Renames),
-            ("modes", []) => Ok(Expression::Modes),
-            ("binaries", []) => Ok(Expression::Binaries),
-            ("added", []) => Ok(Expression::Added),
-            ("deleted", []) => Ok(Expression::Deleted),
-            ("all" | "none" | "renames" | "modes" | "binaries" | "added" | "deleted", _) => Err(
-                QueryError::new(function_offset, format!("{name}() expects no arguments")),
-            ),
-            (
-                "content" | "added_text" | "removed_text" | "regex" | "added_regex"
-                | "removed_regex" | "id",
-                _,
-            ) => Err(QueryError::new(
+            ("all" | "none", _) => Err(QueryError::new(
+                function_offset,
+                format!("{name}() expects no arguments"),
+            )),
+            ("id", _) => Err(QueryError::new(
                 function_offset,
                 format!("{name}() expects one string argument"),
             )),
@@ -243,29 +255,35 @@ impl Parser<'_> {
         Ok(arguments)
     }
 
-    fn parse_glob_union(&mut self) -> Result<GlobExpression, QueryError> {
-        let mut expression = self.parse_glob_intersection_or_difference()?;
+    fn parse_pattern_union(
+        &mut self,
+        default_pattern: DefaultPattern,
+    ) -> Result<PatternExpression, QueryError> {
+        let mut expression = self.parse_pattern_intersection_or_difference(default_pattern)?;
         while self.consume('|') {
-            expression = GlobExpression::Union(
+            expression = PatternExpression::Union(
                 Box::new(expression),
-                Box::new(self.parse_glob_intersection_or_difference()?),
+                Box::new(self.parse_pattern_intersection_or_difference(default_pattern)?),
             );
         }
         Ok(expression)
     }
 
-    fn parse_glob_intersection_or_difference(&mut self) -> Result<GlobExpression, QueryError> {
-        let mut expression = self.parse_glob_complement()?;
+    fn parse_pattern_intersection_or_difference(
+        &mut self,
+        default_pattern: DefaultPattern,
+    ) -> Result<PatternExpression, QueryError> {
+        let mut expression = self.parse_pattern_complement(default_pattern)?;
         loop {
             if self.consume('&') {
-                expression = GlobExpression::Intersection(
+                expression = PatternExpression::Intersection(
                     Box::new(expression),
-                    Box::new(self.parse_glob_complement()?),
+                    Box::new(self.parse_pattern_complement(default_pattern)?),
                 );
             } else if self.consume('~') {
-                expression = GlobExpression::Difference(
+                expression = PatternExpression::Difference(
                     Box::new(expression),
-                    Box::new(self.parse_glob_complement()?),
+                    Box::new(self.parse_pattern_complement(default_pattern)?),
                 );
             } else {
                 return Ok(expression);
@@ -273,24 +291,108 @@ impl Parser<'_> {
         }
     }
 
-    fn parse_glob_complement(&mut self) -> Result<GlobExpression, QueryError> {
+    fn parse_pattern_complement(
+        &mut self,
+        default_pattern: DefaultPattern,
+    ) -> Result<PatternExpression, QueryError> {
         if self.consume('~') {
-            Ok(GlobExpression::Complement(Box::new(
-                self.parse_glob_complement()?,
+            Ok(PatternExpression::Complement(Box::new(
+                self.parse_pattern_complement(default_pattern)?,
             )))
         } else {
-            self.parse_glob_primary()
+            self.parse_pattern_primary(default_pattern)
         }
     }
 
-    fn parse_glob_primary(&mut self) -> Result<GlobExpression, QueryError> {
+    fn parse_pattern_primary(
+        &mut self,
+        default_pattern: DefaultPattern,
+    ) -> Result<PatternExpression, QueryError> {
         self.skip_whitespace();
         if self.consume_raw('(') {
-            let expression = self.parse_glob_union()?;
+            let expression = self.parse_pattern_union(default_pattern)?;
             self.expect(')')?;
             Ok(expression)
         } else {
-            self.parse_string().map(GlobExpression::Pattern)
+            let modifier_offset = self.offset;
+            let modifier = if self.current_character() == Some('"') {
+                match default_pattern {
+                    DefaultPattern::Glob => "glob".to_owned(),
+                    DefaultPattern::Substring => "substring".to_owned(),
+                }
+            } else {
+                let modifier = self.parse_identifier()?;
+                self.expect(':')?;
+                modifier
+            };
+            let argument = self.parse_string_argument()?;
+            let pattern = match modifier.as_str() {
+                "substring" => Pattern::Substring(argument.value),
+                "exact" => Pattern::Exact(argument.value),
+                "glob" => Pattern::Glob(argument.value),
+                "regex" => Pattern::Regex(regex::Regex::new(&argument.value).map_err(|error| {
+                    QueryError::new(argument.offset, format!("invalid regex: {error}"))
+                })?),
+                _ => {
+                    return Err(QueryError::new(
+                        modifier_offset,
+                        format!("unknown pattern modifier `{modifier}`"),
+                    ))
+                }
+            };
+            Ok(PatternExpression::Pattern(pattern))
+        }
+    }
+
+    fn parse_fields(&mut self, operation: OperationKind) -> Result<Vec<Field>, QueryError> {
+        use FieldKind::*;
+        self.skip_whitespace();
+        if self.current_character() == Some(')') {
+            return Ok(Vec::new());
+        }
+        let mut fields = Vec::new();
+        loop {
+            let offset = self.offset;
+            let name = self.parse_identifier()?;
+            let kind = match name.as_str() {
+                "path" => Path,
+                "before_path" => BeforePath,
+                "after_path" => AfterPath,
+                "file" => File,
+                "content" => Content,
+                "from" => From,
+                "to" => To,
+                _ => return Err(QueryError::new(offset, format!("unknown field `{name}`"))),
+            };
+            if fields.iter().any(|field: &Field| field.kind == kind) {
+                return Err(QueryError::new(offset, format!("repeated field `{name}`")));
+            }
+            let allowed = match kind {
+                Path | BeforePath | AfterPath => true,
+                File => matches!(operation, OperationKind::Added | OperationKind::Removed),
+                Content => matches!(
+                    operation,
+                    OperationKind::Changed | OperationKind::Added | OperationKind::Removed
+                ),
+                From | To => operation == OperationKind::Renamed,
+            };
+            if !allowed {
+                return Err(QueryError::new(
+                    offset,
+                    format!("field `{name}` is not supported by this operation"),
+                ));
+            }
+            self.expect(':')?;
+            let default_pattern = if kind == Content {
+                DefaultPattern::Substring
+            } else {
+                DefaultPattern::Glob
+            };
+            let pattern = self.parse_pattern_union(default_pattern)?;
+            fields.push(Field { kind, pattern });
+            if !self.consume(',') {
+                return Ok(fields);
+            }
         }
     }
 

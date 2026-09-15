@@ -514,10 +514,14 @@ fn expand_aliases(
             depth,
             remaining_nodes,
         )?)),
-        Expression::Glob(glob_expression)
-        | Expression::BeforeGlob(glob_expression)
-        | Expression::AfterGlob(glob_expression) => {
-            consume_expansion_nodes(remaining_nodes, glob_expression_nodes(glob_expression))?;
+        Expression::Operation { fields, .. } => {
+            consume_expansion_nodes(
+                remaining_nodes,
+                fields
+                    .iter()
+                    .map(|field| pattern_expression_nodes(&field.pattern))
+                    .sum(),
+            )?;
             expression.clone()
         }
         other => other.clone(),
@@ -543,23 +547,26 @@ fn expression_nodes(expression: &parser::Expression) -> usize {
         Expression::Call { arguments, .. } => {
             1 + arguments.iter().map(expression_nodes).sum::<usize>()
         }
-        Expression::Glob(glob_expression)
-        | Expression::BeforeGlob(glob_expression)
-        | Expression::AfterGlob(glob_expression) => 1 + glob_expression_nodes(glob_expression),
+        Expression::Operation { fields, .. } => {
+            1 + fields
+                .iter()
+                .map(|field| 1 + pattern_expression_nodes(&field.pattern))
+                .sum::<usize>()
+        }
         _ => 1,
     }
 }
 
-fn glob_expression_nodes(expression: &parser::GlobExpression) -> usize {
-    use parser::GlobExpression;
+fn pattern_expression_nodes(expression: &parser::PatternExpression) -> usize {
+    use parser::PatternExpression;
     match expression {
-        GlobExpression::Pattern(_) => 1,
-        GlobExpression::Union(left, right)
-        | GlobExpression::Intersection(left, right)
-        | GlobExpression::Difference(left, right) => {
-            1 + glob_expression_nodes(left) + glob_expression_nodes(right)
+        PatternExpression::Pattern(_) => 1,
+        PatternExpression::Union(left, right)
+        | PatternExpression::Intersection(left, right)
+        | PatternExpression::Difference(left, right) => {
+            1 + pattern_expression_nodes(left) + pattern_expression_nodes(right)
         }
-        GlobExpression::Complement(inner) => 1 + glob_expression_nodes(inner),
+        PatternExpression::Complement(inner) => 1 + pattern_expression_nodes(inner),
     }
 }
 
@@ -589,55 +596,11 @@ fn evaluate_expression(
     match expression {
         Expression::All => universe.clone(),
         Expression::None => HashSet::new(),
-        Expression::Glob(glob_expression) => matching_keys(units, |unit| {
-            unit.old_path
-                .iter()
-                .chain(unit.new_path.iter())
-                .any(|path| evaluate_glob_expression(glob_expression, path))
-        }),
-        Expression::BeforeGlob(glob_expression) => matching_keys(units, |unit| {
-            unit.old_path
-                .as_deref()
-                .is_some_and(|path| evaluate_glob_expression(glob_expression, path))
-        }),
-        Expression::AfterGlob(glob_expression) => matching_keys(units, |unit| {
-            unit.new_path
-                .as_deref()
-                .is_some_and(|path| evaluate_glob_expression(glob_expression, path))
-        }),
-        Expression::Content(literal) => matching_keys(units, |unit| {
-            changed_sides(&unit.change)
-                .into_iter()
-                .any(|side| side.contains(literal))
-        }),
-        Expression::AddedText(literal) => matching_keys(units, |unit| {
-            added_side(&unit.change).is_some_and(|side| side.contains(literal))
-        }),
-        Expression::RemovedText(literal) => matching_keys(units, |unit| {
-            removed_side(&unit.change).is_some_and(|side| side.contains(literal))
-        }),
-        Expression::Regex(regex) => matching_keys(units, |unit| {
-            changed_sides(&unit.change)
-                .into_iter()
-                .any(|side| regex.is_match(side))
-        }),
-        Expression::AddedRegex(regex) => matching_keys(units, |unit| {
-            added_side(&unit.change).is_some_and(|side| regex.is_match(side))
-        }),
-        Expression::RemovedRegex(regex) => matching_keys(units, |unit| {
-            removed_side(&unit.change).is_some_and(|side| regex.is_match(side))
-        }),
+        Expression::Operation { kind, fields } => {
+            matching_keys(units, |unit| operation_matches(*kind, fields, unit))
+        }
         Expression::Id(id) => matching_keys(units, |unit| unit.occurrence_id.as_ref() == Some(id)),
         Expression::Call { .. } => unreachable!("aliases are expanded before evaluation"),
-        Expression::Renames => matching_keys(units, |unit| matches!(unit.change, Change::Rename)),
-        Expression::Modes => matching_keys(units, |unit| matches!(unit.change, Change::Mode)),
-        Expression::Binaries => matching_keys(units, |unit| matches!(unit.change, Change::Binary)),
-        Expression::Added => {
-            matching_keys(units, |unit| matches!(unit.change, Change::Creation { .. }))
-        }
-        Expression::Deleted => {
-            matching_keys(units, |unit| matches!(unit.change, Change::Deletion { .. }))
-        }
         Expression::Union(left, right) => {
             let mut selected = evaluate_expression(left, units, universe);
             selected.extend(evaluate_expression(right, units, universe));
@@ -660,22 +623,100 @@ fn evaluate_expression(
     }
 }
 
-fn evaluate_glob_expression(expression: &parser::GlobExpression, path: &str) -> bool {
-    use parser::GlobExpression;
+fn evaluate_pattern_expression(expression: &parser::PatternExpression, value: &str) -> bool {
+    use parser::{Pattern, PatternExpression};
 
     match expression {
-        GlobExpression::Pattern(pattern) => glob_matches(pattern, path),
-        GlobExpression::Union(left, right) => {
-            evaluate_glob_expression(left, path) || evaluate_glob_expression(right, path)
+        PatternExpression::Pattern(pattern) => match pattern {
+            Pattern::Substring(pattern) => value.contains(pattern),
+            Pattern::Exact(pattern) => value == pattern,
+            Pattern::Glob(pattern) => glob_matches(pattern, value),
+            Pattern::Regex(pattern) => pattern.is_match(value),
+        },
+        PatternExpression::Union(left, right) => {
+            evaluate_pattern_expression(left, value) || evaluate_pattern_expression(right, value)
         }
-        GlobExpression::Intersection(left, right) => {
-            evaluate_glob_expression(left, path) && evaluate_glob_expression(right, path)
+        PatternExpression::Intersection(left, right) => {
+            evaluate_pattern_expression(left, value) && evaluate_pattern_expression(right, value)
         }
-        GlobExpression::Difference(left, right) => {
-            evaluate_glob_expression(left, path) && !evaluate_glob_expression(right, path)
+        PatternExpression::Difference(left, right) => {
+            evaluate_pattern_expression(left, value) && !evaluate_pattern_expression(right, value)
         }
-        GlobExpression::Complement(inner) => !evaluate_glob_expression(inner, path),
+        PatternExpression::Complement(inner) => !evaluate_pattern_expression(inner, value),
     }
+}
+
+fn operation_matches(
+    kind: parser::OperationKind,
+    fields: &[parser::Field],
+    unit: &SelectableUnit,
+) -> bool {
+    use parser::{FieldKind, OperationKind};
+    let kind_matches = match kind {
+        OperationKind::Changed => true,
+        OperationKind::Added => {
+            matches!(unit.change, Change::Creation { .. })
+                || matches!(unit.change, Change::Binary)
+                    && unit.old_path.is_none()
+                    && unit.new_path.is_some()
+                || added_side(&unit.change).is_some_and(|side| !side.is_empty())
+        }
+        OperationKind::Removed => {
+            matches!(unit.change, Change::Deletion { .. })
+                || matches!(unit.change, Change::Binary)
+                    && unit.new_path.is_none()
+                    && unit.old_path.is_some()
+                || removed_side(&unit.change).is_some_and(|side| !side.is_empty())
+        }
+        OperationKind::Renamed => matches!(unit.change, Change::Rename),
+        OperationKind::ModeChanged => matches!(unit.change, Change::Mode),
+        OperationKind::BinaryChanged => matches!(unit.change, Change::Binary),
+    };
+    if !kind_matches {
+        return false;
+    }
+    fields.iter().all(|field| match field.kind {
+        FieldKind::Path => unit
+            .old_path
+            .iter()
+            .chain(unit.new_path.iter())
+            .any(|path| evaluate_pattern_expression(&field.pattern, path)),
+        FieldKind::BeforePath | FieldKind::From => unit
+            .old_path
+            .as_deref()
+            .is_some_and(|path| evaluate_pattern_expression(&field.pattern, path)),
+        FieldKind::AfterPath | FieldKind::To => unit
+            .new_path
+            .as_deref()
+            .is_some_and(|path| evaluate_pattern_expression(&field.pattern, path)),
+        FieldKind::File => match kind {
+            OperationKind::Added => {
+                unit.old_path.is_none()
+                    && unit
+                        .new_path
+                        .as_deref()
+                        .is_some_and(|path| evaluate_pattern_expression(&field.pattern, path))
+            }
+            OperationKind::Removed => {
+                unit.new_path.is_none()
+                    && unit
+                        .old_path
+                        .as_deref()
+                        .is_some_and(|path| evaluate_pattern_expression(&field.pattern, path))
+            }
+            _ => false,
+        },
+        FieldKind::Content => match kind {
+            OperationKind::Changed => changed_content_sides(&unit.change)
+                .into_iter()
+                .any(|side| evaluate_pattern_expression(&field.pattern, side)),
+            OperationKind::Added => added_content_side(&unit.change)
+                .is_some_and(|side| evaluate_pattern_expression(&field.pattern, side)),
+            OperationKind::Removed => removed_content_side(&unit.change)
+                .is_some_and(|side| evaluate_pattern_expression(&field.pattern, side)),
+            _ => false,
+        },
+    })
 }
 
 fn matching_keys(
@@ -689,12 +730,31 @@ fn matching_keys(
         .collect()
 }
 
-fn changed_sides(change: &Change) -> Vec<&str> {
+fn changed_content_sides(change: &Change) -> Vec<&str> {
     match change {
-        Change::Text { removed, added } => vec![removed, added],
+        Change::Text { removed, added } => [removed.as_str(), added.as_str()]
+            .into_iter()
+            .filter(|side| !side.is_empty())
+            .collect(),
         Change::Creation { added } => vec![added],
         Change::Deletion { removed } => vec![removed],
         Change::Rename | Change::Mode | Change::Binary => Vec::new(),
+    }
+}
+
+fn added_content_side(change: &Change) -> Option<&str> {
+    match change {
+        Change::Creation { added } => Some(added),
+        Change::Text { added, .. } if !added.is_empty() => Some(added),
+        _ => None,
+    }
+}
+
+fn removed_content_side(change: &Change) -> Option<&str> {
+    match change {
+        Change::Deletion { removed } => Some(removed),
+        Change::Text { removed, .. } if !removed.is_empty() => Some(removed),
+        _ => None,
     }
 }
 
@@ -715,54 +775,34 @@ fn removed_side(change: &Change) -> Option<&str> {
 fn glob_matches(pattern: &str, path: &str) -> bool {
     let pattern = pattern.chars().collect::<Vec<_>>();
     let path = path.chars().collect::<Vec<_>>();
-    let mut answers = vec![vec![None; path.len() + 1]; pattern.len() + 1];
-    glob_matches_from(&pattern, &path, 0, 0, &mut answers)
-}
-
-fn glob_matches_from(
-    pattern: &[char],
-    path: &[char],
-    pattern_index: usize,
-    path_index: usize,
-    answers: &mut [Vec<Option<bool>>],
-) -> bool {
-    if let Some(answer) = answers[pattern_index][path_index] {
-        return answer;
-    }
-
-    let answer = match pattern.get(pattern_index) {
-        None => path_index == path.len(),
-        Some('*') if pattern.get(pattern_index + 1) == Some(&'*') => {
-            let suffix_index = if pattern.get(pattern_index + 2) == Some(&'/') {
-                pattern_index + 3
-            } else {
-                pattern_index + 2
+    let length = path.len();
+    let mut rows = vec![vec![false; length + 1]; 4];
+    rows[pattern.len() % 4][length] = true;
+    for index in (0..pattern.len()).rev() {
+        let mut current = vec![false; length + 1];
+        let next = rows[(index + 1) % 4].clone();
+        let double_star = pattern.get(index) == Some(&'*') && pattern.get(index + 1) == Some(&'*');
+        let directory_star = double_star && pattern.get(index + 2) == Some(&'/');
+        let suffix = if double_star {
+            rows[(index + if directory_star { 3 } else { 2 }) % 4].clone()
+        } else {
+            Vec::new()
+        };
+        for position in (0..=length).rev() {
+            current[position] = match pattern[index] {
+                '*' if double_star => {
+                    let at_boundary = !directory_star || position == 0 || path[position - 1] == '/';
+                    at_boundary && suffix[position] || position < length && current[position + 1]
+                }
+                '*' => {
+                    next[position]
+                        || position < length && path[position] != '/' && current[position + 1]
+                }
+                '?' => position < length && path[position] != '/' && next[position + 1],
+                literal => position < length && path[position] == literal && next[position + 1],
             };
-            let can_end_directories = pattern.get(pattern_index + 2) != Some(&'/')
-                || path_index == 0
-                || path.get(path_index - 1) == Some(&'/');
-            (can_end_directories
-                && glob_matches_from(pattern, path, suffix_index, path_index, answers))
-                || (path_index < path.len()
-                    && glob_matches_from(pattern, path, pattern_index, path_index + 1, answers))
         }
-        Some('*') => {
-            glob_matches_from(pattern, path, pattern_index + 1, path_index, answers)
-                || (path
-                    .get(path_index)
-                    .is_some_and(|character| *character != '/')
-                    && glob_matches_from(pattern, path, pattern_index, path_index + 1, answers))
-        }
-        Some('?') => {
-            path.get(path_index)
-                .is_some_and(|character| *character != '/')
-                && glob_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
-        }
-        Some(literal) => {
-            path.get(path_index) == Some(literal)
-                && glob_matches_from(pattern, path, pattern_index + 1, path_index + 1, answers)
-        }
-    };
-    answers[pattern_index][path_index] = Some(answer);
-    answer
+        rows[index % 4] = current;
+    }
+    rows[0][0]
 }

@@ -640,7 +640,7 @@ fn binary_query_keeps_unselected_mode_change() {
     let mut permissions = std::fs::metadata(&path).unwrap().permissions();
     permissions.set_mode(0o644);
     std::fs::set_permissions(&path, permissions).unwrap();
-    repo.hunk_ok(&["commit", "--query", "binaries()", "binary only"]);
+    repo.hunk_ok(&["commit", "--query", "binary_changed()", "binary only"]);
 
     assert_eq!(
         repo.jj(&["file", "show", "-r", "@-", "tool.bin"]).stdout,
@@ -665,7 +665,7 @@ fn creation_query_rejects_retained_directory_collision_without_writes() {
 
     let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
     let diff_before = repo.jj_ok(&["diff", "--git"]);
-    let error = repo.hunk_fail(&["commit", "--query", "added()", "must fail"]);
+    let error = repo.hunk_fail(&["commit", "--query", "added(file:glob:\"**\")", "must fail"]);
 
     assert!(error.contains("collides with a retained path"), "{error}");
     assert_eq!(
@@ -685,7 +685,7 @@ fn commit_query_selects_creation_and_leaves_other_changes() {
     repo.hunk_ok(&[
         "commit",
         "--query",
-        "glob(\"selected.txt\") & added()",
+        "changed(path:\"selected.txt\") & added(file:glob:\"**\")",
         "selected creation",
     ]);
 
@@ -705,6 +705,108 @@ fn commit_query_selects_creation_and_leaves_other_changes() {
 }
 
 #[test]
+fn operation_first_added_content_preview_and_commit_select_whole_text_units() {
+    let repo = TestRepo::new("operation-first-added-content");
+    repo.write_file("src/existing.rs", "timeout = 10\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src/existing.rs", "timeout = 20\n");
+    repo.write_file("src/created.rs", "timeout helper\n");
+    repo.write_file("src/empty.rs", "");
+    repo.write_file("src/binary.bin", "binary\0value");
+
+    let query = "added(path:glob:\"src/**\", content:\"timeout\")";
+    let preview: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", query])).unwrap();
+    let paths = preview["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        paths,
+        std::collections::HashSet::from(["src/existing.rs", "src/created.rs"])
+    );
+    repo.hunk_ok(&["commit", "--query", query, "timeout changes"]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/existing.rs"]),
+        "timeout = 20\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/created.rs"]),
+        "timeout helper\n"
+    );
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "src/empty.rs"])
+        .status
+        .success());
+    assert!(!repo
+        .jj(&["file", "show", "-r", "@-", "src/binary.bin"])
+        .status
+        .success());
+}
+
+#[test]
+fn operation_first_added_file_selects_only_creations_including_empty_and_binary() {
+    let repo = TestRepo::new("operation-first-added-file");
+    repo.write_file("src/existing.rs", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src/existing.rs", "new\n");
+    repo.write_file("src/created.rs", "created\n");
+    repo.write_file("src/empty.rs", "");
+    repo.write_file("src/binary.bin", "binary\0value");
+
+    let query = "added(file:glob:\"src/**\")";
+    let preview: serde_json::Value =
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", query])).unwrap();
+    let paths = preview["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|file| file["path"].as_str().unwrap())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(
+        paths,
+        std::collections::HashSet::from(["src/created.rs", "src/empty.rs", "src/binary.bin"])
+    );
+    repo.hunk_ok(&["commit", "--query", query, "created files"]);
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/existing.rs"]),
+        "old\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/created.rs"]),
+        "created\n"
+    );
+    assert_eq!(
+        repo.jj_ok(&["file", "show", "-r", "@-", "src/empty.rs"]),
+        ""
+    );
+    assert_eq!(
+        repo.jj(&["file", "show", "-r", "@-", "src/binary.bin"])
+            .stdout,
+        b"binary\0value"
+    );
+}
+
+#[test]
+fn malformed_operation_field_fails_before_mutation() {
+    let repo = TestRepo::new("operation-first-invalid-field");
+    repo.write_file("src/existing.rs", "old\n");
+    repo.jj_ok(&["commit", "-m", "base"]);
+    repo.write_file("src/existing.rs", "new\n");
+    let before = repo.jj_ok(&["diff", "--git"]);
+    let revision = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
+    let error = repo.hunk_fail(&["commit", "--query", "added(path:regex:\"[\")", "must fail"]);
+    assert!(error.contains("invalid regex"), "{error}");
+    assert_eq!(repo.jj_ok(&["diff", "--git"]), before);
+    assert_eq!(
+        repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
+        revision
+    );
+}
+
+#[test]
 fn occurrence_id_roundtrips_through_all_query_mutations() {
     for command in ["commit", "split", "squash"] {
         let repo = TestRepo::new(&format!("occurrence-id-{command}"));
@@ -714,7 +816,7 @@ fn occurrence_id_roundtrips_through_all_query_mutations() {
         repo.write_file("selected.txt", "new\n");
         repo.write_file("remaining.txt", "new\n");
 
-        let preview = repo.hunk_ok(&["list", "--query", "glob(\"selected.txt\")"]);
+        let preview = repo.hunk_ok(&["list", "--query", "changed(path:\"selected.txt\")"]);
         let value: serde_json::Value = serde_json::from_str(&preview).unwrap();
         let id = value["files"][0]["hunks"][0]["id"].as_str().unwrap();
         let query = format!("id(\"{id}\")");
@@ -757,9 +859,12 @@ fn normal_creation_id_matches_query_file_unit_for_all_mutations() {
             .as_str()
             .unwrap()
             .to_owned();
-        let query_output: serde_json::Value =
-            serde_json::from_str(&repo.hunk_ok(&["list", "--query", "glob(\"created.txt\")"]))
-                .unwrap();
+        let query_output: serde_json::Value = serde_json::from_str(&repo.hunk_ok(&[
+            "list",
+            "--query",
+            "changed(path:\"created.txt\")",
+        ]))
+        .unwrap();
         assert_eq!(query_output["files"][0]["file_units"][0]["id"], ordinary_id);
 
         let query = format!("id(\"{ordinary_id}\")");
@@ -888,9 +993,12 @@ fn empty_file_unit_ids_are_not_legacy_hunk_selectors() {
     let creation = TestRepo::new("occurrence-id-empty-creation-spec");
     creation.jj_ok(&["commit", "-m", "base"]);
     creation.write_file("empty.txt", "");
-    let output: serde_json::Value =
-        serde_json::from_str(&creation.hunk_ok(&["list", "--query", "glob(\"empty.txt\")"]))
-            .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&creation.hunk_ok(&[
+        "list",
+        "--query",
+        "changed(path:\"empty.txt\")",
+    ]))
+    .unwrap();
     let id = output["files"][0]["file_units"][0]["id"].as_str().unwrap();
     let spec = format!(r#"{{"files":{{"empty.txt":{{"ids":["{id}"]}}}}}}"#);
     creation.hunk_ok(&["commit", &spec, "empty creation ID ignored"]);
@@ -903,9 +1011,12 @@ fn empty_file_unit_ids_are_not_legacy_hunk_selectors() {
     deletion.write_file("empty.txt", "");
     deletion.jj_ok(&["commit", "-m", "base"]);
     std::fs::remove_file(deletion.path().join("empty.txt")).unwrap();
-    let output: serde_json::Value =
-        serde_json::from_str(&deletion.hunk_ok(&["list", "--query", "glob(\"empty.txt\")"]))
-            .unwrap();
+    let output: serde_json::Value = serde_json::from_str(&deletion.hunk_ok(&[
+        "list",
+        "--query",
+        "changed(path:\"empty.txt\")",
+    ]))
+    .unwrap();
     let id = output["files"][0]["file_units"][0]["id"].as_str().unwrap();
     let spec = format!(r#"{{"files":{{"empty.txt":{{"ids":["{id}"]}}}}}}"#);
     deletion.hunk_ok(&["commit", &spec, "empty deletion ID ignored"]);
@@ -976,11 +1087,11 @@ fn occurrence_id_changes_when_the_full_comparison_changes() {
     repo.jj_ok(&["commit", "-m", "base"]);
     repo.write_file("selected.txt", "new\n");
     let first: serde_json::Value =
-        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "glob(\"selected.txt\")"]))
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "changed(path:\"selected.txt\")"]))
             .unwrap();
     repo.write_file("other.txt", "changed\n");
     let second: serde_json::Value =
-        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "glob(\"selected.txt\")"]))
+        serde_json::from_str(&repo.hunk_ok(&["list", "--query", "changed(path:\"selected.txt\")"]))
             .unwrap();
     assert_ne!(
         first["files"][0]["hunks"][0]["id"],
@@ -1005,7 +1116,7 @@ fn split_query_rename_only_keeps_old_content() {
     let repo = TestRepo::new("split-query-rename-only");
     prepare_edited_rename(&repo);
 
-    repo.hunk_ok(&["split", "--query", "renames()", "rename only"]);
+    repo.hunk_ok(&["split", "--query", "renamed()", "rename only"]);
     let revision = repo
         .jj_ok(&[
             "log",
@@ -1036,7 +1147,12 @@ fn commit_query_text_only_keeps_old_path() {
     let repo = TestRepo::new("commit-query-text-only");
     prepare_edited_rename(&repo);
 
-    repo.hunk_ok(&["commit", "--query", "content(\"timeout\")", "text only"]);
+    repo.hunk_ok(&[
+        "commit",
+        "--query",
+        "changed(content:\"timeout\")",
+        "text only",
+    ]);
     assert_eq!(
         repo.jj_ok(&["file", "show", "-r", "@-", "src/client.rs"]),
         "header\ntimeout = 20\nfooter\n"
@@ -1055,7 +1171,7 @@ fn commit_query_text_only_keeps_old_path() {
 fn side_regex_preview_and_commit_select_the_same_text_occurrence() {
     let repo = TestRepo::new("query-side-regex-preview-commit");
     prepare_edited_rename(&repo);
-    let query = r#"after_glob("archive/**") & added_regex("timeout\\s*=\\s*20")"#;
+    let query = r#"changed(after_path:"archive/**") & added(content:regex:"timeout\\s*=\\s*20")"#;
 
     let preview = repo.hunk_ok(&["list", "--query", query]);
     let value: serde_json::Value = serde_json::from_str(&preview).unwrap();
@@ -1085,10 +1201,15 @@ fn invalid_regex_fails_before_mutation() {
 
     let revision_before = repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]);
     let diff_before = repo.jj_ok(&["diff", "--git"]);
-    let error = repo.hunk_fail(&["commit", "--query", "regex(\"[\")", "must fail"]);
+    let error = repo.hunk_fail(&[
+        "commit",
+        "--query",
+        "changed(content:regex:\"[\")",
+        "must fail",
+    ]);
 
     assert!(error.contains("invalid regex"), "{error}");
-    assert!(error.contains("byte 6"), "{error}");
+    assert!(error.contains("byte 22"), "{error}");
     assert_eq!(
         repo.jj_ok(&["log", "--no-graph", "-r", "@", "-T", "commit_id"]),
         revision_before
@@ -1105,10 +1226,10 @@ fn alias_preview_and_commit_match_handwritten_expansion() {
     repo.write_file("src/hand.rs", "timeout = 20\n");
     repo.write_file("generated/code.rs", "timeout = 20\n");
 
-    let generated = "generated()=glob(\"generated/**\")";
+    let generated = "generated()=changed(path:\"generated/**\")";
     let handwritten = "handwritten(selection)=(all() ~ generated()) & selection()";
-    let query = "handwritten(content(\"timeout\"))";
-    let expanded = "(all() ~ glob(\"generated/**\")) & content(\"timeout\")";
+    let query = "handwritten(changed(content:\"timeout\"))";
+    let expanded = "(all() ~ changed(path:\"generated/**\")) & changed(content:\"timeout\")";
     let aliased_preview = repo.hunk_ok(&[
         "--alias",
         generated,
@@ -1150,7 +1271,7 @@ fn aliases_load_from_jj_config_and_command_line_overrides_by_name() {
     let repo = TestRepo::new("query-config-aliases");
     repo.append_config(
         r#"[hunkset-aliases]
-"generated()" = 'glob("generated/**")'
+"generated()" = 'changed(path:"generated/**")'
 "handwritten(selection)" = '(all() ~ generated()) & selection()'
 "scope(selection)" = 'selection()'"#,
     );
@@ -1160,7 +1281,7 @@ fn aliases_load_from_jj_config_and_command_line_overrides_by_name() {
     repo.write_file("src/hand.rs", "timeout = 20\n");
     repo.write_file("generated/code.rs", "timeout = 20\n");
 
-    let query = "handwritten(content(\"timeout\"))";
+    let query = "handwritten(changed(content:\"timeout\"))";
     let configured = repo.hunk_ok(&["list", "--query", query]);
     let configured: serde_json::Value = serde_json::from_str(&configured).unwrap();
     assert_eq!(configured["files"].as_array().unwrap().len(), 1);
@@ -1168,7 +1289,7 @@ fn aliases_load_from_jj_config_and_command_line_overrides_by_name() {
 
     let overridden = repo.hunk_ok(&[
         "--alias",
-        "generated()=glob(\"src/**\")",
+        "generated()=changed(path:\"src/**\")",
         "list",
         "--query",
         query,
@@ -1179,7 +1300,7 @@ fn aliases_load_from_jj_config_and_command_line_overrides_by_name() {
 
     let replaced_signature = repo.hunk_ok(&[
         "--alias",
-        "scope()=glob(\"src/**\")",
+        "scope()=changed(path:\"src/**\")",
         "list",
         "--query",
         "scope()",
@@ -1209,7 +1330,7 @@ fn command_line_alias_shadows_invalid_config_body_for_preview_and_mutation() {
     repo.write_file("src/selected.rs", "timeout = 20\n");
     repo.write_file("generated/remaining.rs", "timeout = 20\n");
 
-    let command_line_alias = "scope()=glob(\"src/**\")";
+    let command_line_alias = "scope()=changed(path:\"src/**\")";
     let preview = repo.hunk_ok(&["--alias", command_line_alias, "list", "--query", "scope()"]);
     let preview: serde_json::Value = serde_json::from_str(&preview).unwrap();
     assert_eq!(preview["files"].as_array().unwrap().len(), 1);
@@ -1246,7 +1367,7 @@ fn unshadowed_invalid_config_body_fails_before_mutation() {
     let error = repo.hunk_fail(&[
         "commit",
         "--query",
-        "scope(content(\"timeout\"))",
+        "scope(changed(content:\"timeout\"))",
         "must fail",
     ]);
 
@@ -1271,7 +1392,7 @@ fn invalid_alias_configuration_fails_before_mutation() {
     let error = repo.hunk_fail(&[
         "commit",
         "--alias",
-        "content()=all()",
+        "changed()=all()",
         "--query",
         "all()",
         "must fail",
@@ -1290,7 +1411,11 @@ fn squash_query_combined_rename_and_text_applies_both() {
     let repo = TestRepo::new("squash-query-combined");
     prepare_edited_rename(&repo);
 
-    repo.hunk_ok(&["squash", "--query", "renames() | content(\"timeout\")"]);
+    repo.hunk_ok(&[
+        "squash",
+        "--query",
+        "renamed() | changed(content:\"timeout\")",
+    ]);
     assert_eq!(
         repo.jj_ok(&["file", "show", "-r", "@-", "archive/client.rs"]),
         "header\ntimeout = 20\nfooter\n"
@@ -1329,7 +1454,7 @@ fn commit_query_applies_file_units_and_preserves_unselected_text() {
     repo.hunk_ok(&[
         "commit",
         "--query",
-        "added() | deleted() | binaries() | modes()",
+        "added(file:glob:\"**\") | removed(file:glob:\"**\") | binary_changed() | mode_changed()",
         "file units",
     ]);
 
@@ -1436,7 +1561,7 @@ fn list_query_selects_whole_blocks_in_the_requested_revision() {
         "-r",
         "@-",
         "--query",
-        "glob(\"src/**\") & content(\"timeout\")",
+        "changed(path:\"src/**\") & changed(content:\"timeout\")",
     ]);
     let value: serde_json::Value = serde_json::from_str(&output).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 1);
@@ -1460,7 +1585,7 @@ fn list_query_evaluates_complete_content_before_display_limits() {
         "-r",
         "@-",
         "--query",
-        "content(\"timeout\")",
+        "changed(content:\"timeout\")",
         "--max-lines",
         "1",
     ]);
@@ -1473,7 +1598,7 @@ fn list_query_selects_creation_and_binary_units_and_rejects_conflicting_filters(
     let repo = TestRepo::new("list-query-errors");
     repo.write_file("created.rs", "timeout\n");
 
-    let creation = repo.hunk_ok(&["list", "--query", "content(\"timeout\")"]);
+    let creation = repo.hunk_ok(&["list", "--query", "changed(content:\"timeout\")"]);
     let value: serde_json::Value = serde_json::from_str(&creation).unwrap();
     assert_eq!(value["files"][0]["file_units"][0]["kind"], "creation");
     assert_eq!(value["files"][0]["file_units"][0]["added"], "timeout\n");
@@ -1481,7 +1606,7 @@ fn list_query_selects_creation_and_binary_units_and_rejects_conflicting_filters(
     let binary_repo = TestRepo::new("list-query-binary");
     binary_repo.jj_ok(&["commit", "-m", "base"]);
     binary_repo.write_file("binary.dat", "value\0binary");
-    let binary = binary_repo.hunk_ok(&["list", "--query", "binaries()", "--binary", "skip"]);
+    let binary = binary_repo.hunk_ok(&["list", "--query", "binary_changed()", "--binary", "skip"]);
     let value: serde_json::Value = serde_json::from_str(&binary).unwrap();
     assert_eq!(value["files"][0]["file_units"][0]["kind"], "binary");
 
@@ -1515,12 +1640,12 @@ fn list_query_keeps_mode_and_text_units_independent() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(pure_mode_path, permissions).unwrap();
 
-    let text = repo.hunk_ok(&["list", "--query", "content(\"new\")"]);
+    let text = repo.hunk_ok(&["list", "--query", "changed(content:\"new\")"]);
     let value: serde_json::Value = serde_json::from_str(&text).unwrap();
     assert_eq!(value["files"][0]["hunks"].as_array().unwrap().len(), 1);
     assert!(value["files"][0].get("file_units").is_none());
 
-    let mode = repo.hunk_ok(&["list", "--query", "modes()"]);
+    let mode = repo.hunk_ok(&["list", "--query", "mode_changed()"]);
     let value: serde_json::Value = serde_json::from_str(&mode).unwrap();
     let files = value["files"].as_array().unwrap();
     assert_eq!(files.len(), 2, "{mode}");
@@ -1543,7 +1668,7 @@ fn list_query_selects_text_file_units_and_empty_files() {
     repo.write_file("created.txt", "added content\n");
     repo.write_file("empty-created.txt", "");
 
-    let added = repo.hunk_ok(&["list", "--query", "added()"]);
+    let added = repo.hunk_ok(&["list", "--query", "added(file:glob:\"**\")"]);
     let value: serde_json::Value = serde_json::from_str(&added).unwrap();
     let files = value["files"].as_array().unwrap();
     assert_eq!(files.len(), 2, "{added}");
@@ -1554,7 +1679,7 @@ fn list_query_selects_text_file_units_and_empty_files() {
         .iter()
         .any(|file| file["file_units"][0]["added"] == ""));
 
-    let deleted = repo.hunk_ok(&["list", "--query", "deleted()"]);
+    let deleted = repo.hunk_ok(&["list", "--query", "removed(file:glob:\"**\")"]);
     let value: serde_json::Value = serde_json::from_str(&deleted).unwrap();
     let files = value["files"].as_array().unwrap();
     assert_eq!(files.len(), 2, "{deleted}");
@@ -1565,7 +1690,7 @@ fn list_query_selects_text_file_units_and_empty_files() {
         .iter()
         .any(|file| file["file_units"][0]["removed"] == ""));
 
-    let content = repo.hunk_ok(&["list", "--query", "content(\"added content\")"]);
+    let content = repo.hunk_ok(&["list", "--query", "changed(content:\"added content\")"]);
     let value: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 1);
     assert_eq!(value["files"][0]["file_units"][0]["kind"], "creation");
@@ -1625,16 +1750,16 @@ fn list_query_does_not_invent_binary_units_for_rename_or_mode_only() {
     permissions.set_mode(0o755);
     std::fs::set_permissions(mode_path, permissions).unwrap();
 
-    let binaries = repo.hunk_ok(&["list", "--query", "binaries()"]);
+    let binaries = repo.hunk_ok(&["list", "--query", "binary_changed()"]);
     let value: serde_json::Value = serde_json::from_str(&binaries).unwrap();
     assert!(value["files"].as_array().unwrap().is_empty(), "{binaries}");
 
-    let renames = repo.hunk_ok(&["list", "--query", "renames()"]);
+    let renames = repo.hunk_ok(&["list", "--query", "renamed()"]);
     let value: serde_json::Value = serde_json::from_str(&renames).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 1, "{renames}");
     assert_eq!(value["files"][0]["file_units"][0]["kind"], "rename");
 
-    let modes = repo.hunk_ok(&["list", "--query", "modes()"]);
+    let modes = repo.hunk_ok(&["list", "--query", "mode_changed()"]);
     let value: serde_json::Value = serde_json::from_str(&modes).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 1, "{modes}");
     assert_eq!(value["files"][0]["file_units"][0]["kind"], "mode");
@@ -1661,7 +1786,7 @@ fn list_query_keeps_edited_rename_and_text_units_independent() {
     repo.write_file("archive/client.rs", "header\ntimeout = 20\nfooter\n");
     repo.write_file("tests/client.rs", "header\ntimeout = 20\nfooter\n");
 
-    let rename = repo.hunk_ok(&["list", "--query", "renames()"]);
+    let rename = repo.hunk_ok(&["list", "--query", "renamed()"]);
     let value: serde_json::Value = serde_json::from_str(&rename).unwrap();
     let files = value["files"].as_array().unwrap();
     assert_eq!(files.len(), 2, "{rename}");
@@ -1675,7 +1800,7 @@ fn list_query_keeps_edited_rename_and_text_units_independent() {
     let content = repo.hunk_ok(&[
         "list",
         "--query",
-        "content(\"timeout\") & glob(\"archive/**\")",
+        "changed(content:\"timeout\") & changed(path:\"archive/**\")",
     ]);
     let value: serde_json::Value = serde_json::from_str(&content).unwrap();
     assert_eq!(value["files"].as_array().unwrap().len(), 1, "{content}");
@@ -1686,7 +1811,7 @@ fn list_query_keeps_edited_rename_and_text_units_independent() {
     let combined = repo.hunk_ok(&[
         "list",
         "--query",
-        "(glob(\"src/**\") & renames()) | ((glob(\"src/**\") | glob(\"tests/**\")) & content(\"timeout\"))",
+        "(changed(path:\"src/**\") & renamed()) | ((changed(path:\"src/**\") | changed(path:\"tests/**\")) & changed(content:\"timeout\"))",
     ]);
     let value: serde_json::Value = serde_json::from_str(&combined).unwrap();
     let files = value["files"].as_array().unwrap();
